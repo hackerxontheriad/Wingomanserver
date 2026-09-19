@@ -1234,12 +1234,17 @@ def index():
 # ==============================================================================
 # START
 # ==============================================================================
+# ==============================================================================
+# START
+# ==============================================================================
 if __name__ == "__main__":
     t = threading.Thread(target=poll_loop, daemon=True)
     t.start()
     print("\n" + "═"*70)
     print("  XOMAT AI PRO v4.0 — Flask Web Edition")
     print("  ➜  http://localhost:5000")
-    print("  ➜  API endpoints: /api/analysis  /api/history  /api/stats")
     print("═"*70 + "\n")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    
+    # ↓↓↓ YE 2 LINES ZAROOR CHANGE KARO ↓↓↓
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
