@@ -425,36 +425,44 @@ def poll_loop():
                 _cache["apiStatus"] = f"live ({len(api_list)})"
                 newest = str(api_list[0].get("issueNumber", ""))
 
+                # Step 1: Sync new records if issue changed
                 if newest != last_seen:
                     added = sync_store(store, api_list)
                     last_seen = store.get("lastIssue")
                     if added > 0 or not store.get("pendingPeriods"):
-                        engine = XomatEngine(store["records"])
-                        analysis = engine.predict(periods=3)
+                        tmp_engine = XomatEngine(store["records"])
+                        tmp_analysis = tmp_engine.predict(periods=3)
                         preds = []
                         iss = store.get("lastIssue") or "0"
-                        for p in analysis["periods"]:
+                        for p in tmp_analysis["periods"]:
                             iss = next_issue(iss)
-                            preds.append({"forIssue": iss, "number": p["number"],
-                                          "bs": p["bs"], "color": p["color"],
-                                          "rank": p["rank"]})
+                            preds.append({
+                                "forIssue": iss,
+                                "number": p["number"],
+                                "bs": p["bs"],
+                                "color": p["color"],
+                                "rank": p["rank"]
+                            })
                         store["pendingPeriods"] = preds
                         store["lastPrediction"] = preds[0] if preds else None
                         save_store(store)
                         _cache["newPrediction"] = True
-                else:
-                    engine = XomatEngine(store["records"])
-                    analysis = engine.predict(periods=3)
 
+                # Step 2: ALWAYS compute analysis (yeh line fix hai!)
+                engine = XomatEngine(store["records"])
+                analysis = engine.predict(periods=3)
+
+                # Step 3: Update cache
                 _cache["analysis"] = analysis
                 _cache["stats"] = store["stats"]
                 _cache["lastIssue"] = store.get("lastIssue") or "--"
                 _cache["total"] = len(store["records"])
                 _cache["lastSync"] = time.time()
+
         except Exception as e:
             log(f"poll error: {e}")
         time.sleep(POLL_SEC)
-
+     
 def _start_poller():
     global _poller_started
     with _poller_lock:
