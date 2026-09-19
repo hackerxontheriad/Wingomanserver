@@ -463,17 +463,33 @@ def poll_loop():
             log(f"poll error: {e}")
         time.sleep(POLL_SEC)
      
-def _start_poller():
-    global _poller_started
-    with _poller_lock:
-        if _poller_started: return
-        _poller_started = True
-        t = threading.Thread(target=poll_loop, daemon=True, name="xomat-poller")
-        t.start()
-        log("✅ Poll thread STARTED")
+_poller_thread = None
 
-# START AT MODULE LEVEL — Gunicorn compatible!
-_start_poller()
+def _start_poller():
+    """Start poller if not already running (safe for gunicorn fork)."""
+    global _poller_thread, _poller_started
+    with _poller_lock:
+        # Already running? Skip.
+        if _poller_thread is not None and _poller_thread.is_alive():
+            return
+        # Start new thread
+        _poller_thread = threading.Thread(target=poll_loop, daemon=True, name="xomat-poller")
+        _poller_thread.start()
+        _poller_started = True
+        log("✅ Poll thread STARTED (post-fork safe)")
+
+# Try at import time (works for direct `python app.py`)
+try:
+    _start_poller()
+except Exception as e:
+    log(f"Initial poller start failed: {e}")
+
+# CRITICAL: Also start on first request (works in gunicorn after fork)
+@app.before_request
+def _ensure_poller_running():
+    """Guarantee poller is alive whenever any request comes in."""
+    if _poller_thread is None or not _poller_thread.is_alive():
+        _start_poller()
 
 # ==============================================================================
 # ROUTES
