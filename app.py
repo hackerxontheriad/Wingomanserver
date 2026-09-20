@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- XOMAT AI PRO v6.0 — ULTRA VFX + TTS Edition
- Fixed Poller + Live API + 3-Period Prediction + Voice Announcements
+ XOMAT AI PRO v7.0 — APScheduler + External Cron + AI Training Pipeline
+ Full Background Data Collection | Gunicorn Safe | 24/7 via cron-job.org
 ==============================================================================
 """
-import os, json, time, math, threading
+import os, json, time, math, threading, csv
 from datetime import datetime, timezone
 import requests
 import numpy as np
@@ -16,6 +16,14 @@ try:
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+    HAS_APSCHEDULER = True
+except ImportError:
+    HAS_APSCHEDULER = False
+    print("[xomat] ⚠ apscheduler not installed — falling back to threading", flush=True)
 
 from flask import Flask, jsonify, render_template_string
 from flask_cors import CORS
@@ -39,11 +47,15 @@ API_HEADERS = {
     "Prefer": "apiversion=2.1",
 }
 
+# Render Disk mounted at /data? Use it, else local dir
 DATA_DIR  = "/data" if os.path.exists("/data") else os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(DATA_DIR, "wingo.json")
-POLL_SEC  = 5
+CSV_FILE  = os.path.join(DATA_DIR, "training_data.csv")
+LOG_FILE  = os.path.join(DATA_DIR, "cron.log")
+
+POLL_SEC  = 5           # internal scheduler interval
 TIMEOUT   = 12
-HISTORY_LIMIT = 5000
+HISTORY_LIMIT = 50000   # 50k max records in JSON (CSV unlimited)
 
 app = Flask(__name__)
 CORS(app)
@@ -72,7 +84,20 @@ def next_issue(iss):
     except: return iss
 
 def log(msg):
-    print(f"[xomat] {msg}", flush=True)
+    line = f"[xomat {datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    # Also append to log file (max 500 lines)
+    try:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r") as f:
+                lines = f.readlines()[-499:]
+        else:
+            lines = []
+        lines.append(line + "\n")
+        with open(LOG_FILE, "w") as f:
+            f.writelines(lines)
+    except:
+        pass
 
 # ==============================================================================
 # STORE
@@ -108,6 +133,31 @@ def save_store(store):
     except Exception as e:
         log(f"save error: {e}")
 
+def append_to_csv(records):
+    """AI training ke liye CSV me append karo."""
+    try:
+        new_file = not os.path.exists(CSV_FILE)
+        with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["issue", "number", "size", "color", "ts", "iso_time",
+                            "win", "predictedNumber", "predictedBS", "predictedColor"])
+            for r in records:
+                w.writerow([
+                    r.get("issue", ""),
+                    r.get("number", ""),
+                    r.get("size", ""),
+                    r.get("color", ""),
+                    r.get("ts", ""),
+                    datetime.fromtimestamp(r.get("ts", 0), timezone.utc).isoformat() if r.get("ts") else "",
+                    r.get("win") if r.get("win") is not None else "",
+                    r.get("predictedNumber", ""),
+                    r.get("predictedBS", ""),
+                    r.get("predictedColor", ""),
+                ])
+    except Exception as e:
+        log(f"CSV append error: {e}")
+
 # ==============================================================================
 # API FETCH
 # ==============================================================================
@@ -115,16 +165,13 @@ def fetch_api():
     for url in API_ENDPOINTS:
         try:
             r = requests.get(url, timeout=TIMEOUT, headers=API_HEADERS)
-            log(f"API {r.status_code} ← {url[-45:]}")
-            if r.status_code != 200: continue
+            if r.status_code != 200:
+                continue
             data = r.json()
             lst = data.get("data", {}).get("list", [])
             if lst:
-                log(f"✅ Got {len(lst)} records")
                 return lst
-            log(f"⚠️ Empty list")
         except Exception as e:
-            log(f"❌ {url[-45:]}: {str(e)[:60]}")
             continue
     return None
 
@@ -281,7 +328,7 @@ class XomatEngine:
         runs = self.runs_test()
 
         if self.bs_streak >= 5: pattern = "DRAGON STREAK — BREAK IMMINENT"
-        elif chi["biased"]: pattern = f"RNG BIAS DETECTED"
+        elif chi["biased"]: pattern = "RNG BIAS DETECTED"
         elif runs["verdict"] == "PATTERN": pattern = "AUTOCORRELATION PATTERN"
         elif len(self.missing) >= 4: pattern = "MULTI-MISSING CYCLE"
         elif self.m1t and (self.m1[ranked[0]] / self.m1t) > 0.18: pattern = "MARKOV STRONG SIGNAL"
@@ -350,6 +397,7 @@ def sync_store(store, api_list):
     pending = store.get("pendingPeriods") or []
     pending_by_issue = {str(p.get("forIssue")): p for p in pending}
     added = 0
+    new_records = []
 
     for item in reversed(api_list):
         iss = str(item.get("issueNumber", ""))
@@ -369,11 +417,16 @@ def sync_store(store, api_list):
         else:
             rec["win"] = None
         store["records"].insert(0, rec)
+        new_records.append(rec)
         seen.add(iss)
         added += 1
 
     if len(store["records"]) > HISTORY_LIMIT:
         store["records"] = store["records"][:HISTORY_LIMIT]
+
+    # Save new records to CSV for AI training
+    if new_records:
+        append_to_csv(new_records)
 
     s = empty_stats()
     for r in store["records"]:
@@ -393,103 +446,155 @@ def sync_store(store, api_list):
     return added
 
 # ==============================================================================
-# POLLER (module-level start — GUNICORN SAFE)
+# CACHE
 # ==============================================================================
 _store_lock = threading.Lock()
 _cache = {"analysis": None, "stats": empty_stats(),
           "lastIssue": "--", "total": 0, "online": False,
-          "lastSync": 0, "apiStatus": "connecting", "newPrediction": False}
-_poller_started = False
-_poller_lock = threading.Lock()
+          "lastSync": 0, "apiStatus": "connecting", "newPrediction": False,
+          "cronTicks": 0, "lastCronResult": None}
 
-def poll_loop():
-    log("🚀 Poll loop started")
-    store = load_store()
-    last_seen = store.get("lastIssue")
-    fails = 0
-
-    while True:
-        try:
-            api_list = fetch_api()
-            if api_list is None:
-                fails += 1
-                with _store_lock:
-                    _cache["online"] = False
-                    _cache["apiStatus"] = f"offline ({fails} fails)"
-                time.sleep(POLL_SEC)
-                continue
-
-            fails = 0
+# ==============================================================================
+# CORE CRON JOB (both APScheduler and external cron call this)
+# ==============================================================================
+def cron_fetch_and_save(trigger="internal"):
+    """Main cron job — fetch API, save to JSON + CSV, update cache."""
+    try:
+        with _store_lock:
+            _cache["cronTicks"] += 1
+        api_list = fetch_api()
+        if not api_list:
             with _store_lock:
-                _cache["online"] = True
-                _cache["apiStatus"] = f"live ({len(api_list)})"
-                newest = str(api_list[0].get("issueNumber", ""))
+                _cache["online"] = False
+                _cache["apiStatus"] = "offline — API no data"
+                _cache["lastCronResult"] = f"{trigger}: no data at {datetime.now(timezone.utc).strftime('%H:%M:%S')}"
+            return {"ok": False, "reason": "no data"}
 
-                # Step 1: Sync new records if issue changed
-                if newest != last_seen:
-                    added = sync_store(store, api_list)
-                    last_seen = store.get("lastIssue")
-                    if added > 0 or not store.get("pendingPeriods"):
-                        tmp_engine = XomatEngine(store["records"])
-                        tmp_analysis = tmp_engine.predict(periods=3)
-                        preds = []
-                        iss = store.get("lastIssue") or "0"
-                        for p in tmp_analysis["periods"]:
-                            iss = next_issue(iss)
-                            preds.append({
-                                "forIssue": iss,
-                                "number": p["number"],
-                                "bs": p["bs"],
-                                "color": p["color"],
-                                "rank": p["rank"]
-                            })
-                        store["pendingPeriods"] = preds
-                        store["lastPrediction"] = preds[0] if preds else None
-                        save_store(store)
-                        _cache["newPrediction"] = True
+        store = load_store()
+        newest = str(api_list[0].get("issueNumber", ""))
+        last_seen = store.get("lastIssue")
+        added = 0
 
-                # Step 2: ALWAYS compute analysis (yeh line fix hai!)
-                engine = XomatEngine(store["records"])
-                analysis = engine.predict(periods=3)
+        if newest != last_seen:
+            added = sync_store(store, api_list)
+            log(f"🆕 New issue: {newest} | Added {added} records | Trigger: {trigger}")
+            last_seen = store.get("lastIssue")
 
-                # Step 3: Update cache
-                _cache["analysis"] = analysis
-                _cache["stats"] = store["stats"]
-                _cache["lastIssue"] = store.get("lastIssue") or "--"
-                _cache["total"] = len(store["records"])
-                _cache["lastSync"] = time.time()
+            # Recompute predictions
+            tmp_engine = XomatEngine(store["records"])
+            tmp_analysis = tmp_engine.predict(periods=3)
+            preds = []
+            iss = store.get("lastIssue") or "0"
+            for p in tmp_analysis["periods"]:
+                iss = next_issue(iss)
+                preds.append({
+                    "forIssue": iss, "number": p["number"],
+                    "bs": p["bs"], "color": p["color"], "rank": p["rank"]
+                })
+            store["pendingPeriods"] = preds
+            store["lastPrediction"] = preds[0] if preds else None
+            save_store(store)
+            with _store_lock:
+                _cache["newPrediction"] = True
+        else:
+            log(f"⏰ No new issue ({newest}) | Trigger: {trigger}")
 
-        except Exception as e:
-            log(f"poll error: {e}")
-        time.sleep(POLL_SEC)
-     
-_poller_thread = None
+        # Always refresh analysis in cache
+        with _store_lock:
+            engine = XomatEngine(store["records"])
+            _cache["analysis"] = engine.predict(periods=3)
+            _cache["stats"] = store["stats"]
+            _cache["lastIssue"] = store.get("lastIssue") or "--"
+            _cache["total"] = len(store["records"])
+            _cache["lastSync"] = time.time()
+            _cache["online"] = True
+            _cache["apiStatus"] = f"live ({len(api_list)})"
+            _cache["lastCronResult"] = f"{trigger}: ok | +{added} | {newest}"
 
-def _start_poller():
-    """Start poller if not already running (safe for gunicorn fork)."""
-    global _poller_thread, _poller_started
-    with _poller_lock:
-        # Already running? Skip.
-        if _poller_thread is not None and _poller_thread.is_alive():
+        return {"ok": True, "added": added, "newest": newest, "total": len(store["records"])}
+
+    except Exception as e:
+        log(f"❌ Cron error ({trigger}): {e}")
+        with _store_lock:
+            _cache["online"] = False
+            _cache["apiStatus"] = f"error: {str(e)[:50]}"
+            _cache["lastCronResult"] = f"{trigger}: error {str(e)[:80]}"
+        return {"ok": False, "error": str(e)}
+
+# ==============================================================================
+# INTERNAL SCHEDULER (APScheduler) — fork-safe
+# ==============================================================================
+_scheduler = None
+_scheduler_lock = threading.Lock()
+
+def start_scheduler():
+    """Start APScheduler once per process (safe for gunicorn fork)."""
+    global _scheduler
+    if not HAS_APSCHEDULER:
+        # Fallback: use threading loop
+        return _start_thread_fallback()
+    
+    with _scheduler_lock:
+        if _scheduler is not None and _scheduler.running:
             return
-        # Start new thread
-        _poller_thread = threading.Thread(target=poll_loop, daemon=True, name="xomat-poller")
-        _poller_thread.start()
-        _poller_started = True
-        log("✅ Poll thread STARTED (post-fork safe)")
+        try:
+            _scheduler = BackgroundScheduler(
+                daemon=True,
+                job_defaults={
+                    "coalesce": True,
+                    "max_instances": 1,
+                    "misfire_grace_time": 30,
+                }
+            )
+            _scheduler.add_job(
+                cron_fetch_and_save,
+                trigger=IntervalTrigger(seconds=POLL_SEC),
+                id="xomat_fetch",
+                name="Fetch WinGo data",
+                replace_existing=True,
+                kwargs={"trigger": "APScheduler"},
+            )
+            _scheduler.start()
+            log(f"✅ APScheduler started — every {POLL_SEC}s")
+        except Exception as e:
+            log(f"❌ Scheduler start failed: {e}")
 
-# Try at import time (works for direct `python app.py`)
+# Fallback if APScheduler not available
+_fallback_thread = None
+_fallback_lock = threading.Lock()
+
+def _start_thread_fallback():
+    global _fallback_thread
+    with _fallback_lock:
+        if _fallback_thread is not None and _fallback_thread.is_alive():
+            return
+        def _loop():
+            log("🚀 Fallback thread poller started")
+            while True:
+                cron_fetch_and_save(trigger="fallback-thread")
+                time.sleep(POLL_SEC)
+        _fallback_thread = threading.Thread(target=_loop, daemon=True, name="xomat-fallback")
+        _fallback_thread.start()
+        log("✅ Fallback thread started")
+
+# Try at import time
 try:
-    _start_poller()
+    start_scheduler()
 except Exception as e:
-    log(f"Initial poller start failed: {e}")
+    log(f"Initial scheduler failed: {e}")
 
-# CRITICAL: Also start on first request (works in gunicorn after fork)
+# ═══════════════════════════════════════════════════════════════════════════
+# GUNICORN FORK SAFETY — restart scheduler on first request after fork
+# ═══════════════════════════════════════════════════════════════════════════
 @app.before_request
-def _ensure_poller_running():
-    """Guarantee poller is alive whenever any request comes in."""
-    if _poller_thread is None or not _poller_thread.is_alive():
-        _start_poller()
+def _ensure_scheduler():
+    """Har request pe check karo — agar scheduler band hai to restart."""
+    global _scheduler
+    if HAS_APSCHEDULER:
+        if _scheduler is None or not _scheduler.running:
+            start_scheduler()
+    else:
+        _start_thread_fallback()
 
 # ==============================================================================
 # ROUTES
@@ -522,21 +627,90 @@ def api_stats():
     store = load_store()
     return jsonify({"ok": True, "stats": store["stats"], "total": len(store["records"])})
 
+@app.route("/api/cron-tick")
+def api_cron_tick():
+    """External cron (cron-job.org) ye endpoint hit karega → fetch + save."""
+    result = cron_fetch_and_save(trigger="external-cron")
+    with _store_lock:
+        return jsonify({
+            "ok": result.get("ok", False),
+            "trigger": "external-cron",
+            "result": result,
+            "apiStatus": _cache.get("apiStatus"),
+            "total": _cache.get("total"),
+            "lastIssue": _cache.get("lastIssue"),
+            "serverTime": time.time(),
+        })
+
 @app.route("/api/debug")
 def api_debug():
     with _store_lock:
+        sched_status = "not-started"
+        jobs_info = []
+        if HAS_APSCHEDULER and _scheduler is not None:
+            sched_status = "running" if _scheduler.running else "stopped"
+            try:
+                for job in _scheduler.get_jobs():
+                    jobs_info.append({
+                        "id": job.id,
+                        "next_run": str(job.next_run_time) if job.next_run_time else None,
+                        "trigger": str(job.trigger),
+                    })
+            except: pass
+        elif _fallback_thread is not None:
+            sched_status = "fallback-thread" if _fallback_thread.is_alive() else "dead"
+
         return jsonify({
-            "ok": True, "pollerStarted": _poller_started,
+            "ok": True,
+            "scheduler": sched_status,
+            "schedulerJobs": jobs_info,
+            "apschedulerAvailable": HAS_APSCHEDULER,
             "apiStatus": _cache.get("apiStatus"),
             "online": _cache.get("online"),
             "lastSync": _cache.get("lastSync"),
+            "lastSyncHuman": datetime.fromtimestamp(_cache.get("lastSync", 0), timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') if _cache.get("lastSync") else None,
             "total": _cache.get("total"),
             "hasAnalysis": _cache.get("analysis") is not None,
             "lastIssue": _cache.get("lastIssue"),
+            "cronTicks": _cache.get("cronTicks", 0),
+            "lastCronResult": _cache.get("lastCronResult"),
+            "wingoFileExists": os.path.exists(DATA_FILE),
+            "wingoFileSize": os.path.getsize(DATA_FILE) if os.path.exists(DATA_FILE) else 0,
+            "csvFileExists": os.path.exists(CSV_FILE),
+            "csvFileSize": os.path.getsize(CSV_FILE) if os.path.exists(CSV_FILE) else 0,
+            "dataDir": DATA_DIR,
+            "usingRenderDisk": DATA_DIR == "/data",
         })
 
+@app.route("/api/daily-report")
+def api_daily_report():
+    """Aaj kitne records aaye."""
+    store = load_store()
+    today = datetime.now(timezone.utc).date()
+    today_records = [
+        r for r in store["records"]
+        if r.get("ts") and datetime.fromtimestamp(r["ts"], timezone.utc).date() == today
+    ]
+    return jsonify({
+        "ok": True,
+        "date": str(today),
+        "recordsToday": len(today_records),
+        "totalRecords": len(store["records"]),
+        "csvExists": os.path.exists(CSV_FILE),
+        "csvSizeMB": round(os.path.getsize(CSV_FILE) / 1024 / 1024, 2) if os.path.exists(CSV_FILE) else 0,
+    })
+
+@app.route("/api/export-csv")
+def api_export_csv():
+    """CSV file download — AI training ke liye."""
+    if not os.path.exists(CSV_FILE):
+        return jsonify({"ok": False, "msg": "CSV not created yet"}), 404
+    from flask import send_file
+    return send_file(CSV_FILE, mimetype="text/csv",
+                     as_attachment=True, download_name="wingo_training_data.csv")
+
 # ==============================================================================
-# FRONTEND — ULTRA VFX + TTS
+# FRONTEND
 # ==============================================================================
 INDEX_HTML = r"""
 <!DOCTYPE html>
@@ -544,7 +718,7 @@ INDEX_HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XOMAT AI PRO v6 — ULTRA VFX + TTS</title>
+<title>XOMAT AI PRO v7 — ULTRA VFX + TTS + Auto Cron</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&family=Orbitron:wght@600;700;900&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
@@ -554,7 +728,6 @@ INDEX_HTML = r"""
   --maroon:#6B0F1A; --maroon-2:#8B1420; --maroon-3:#4A0812;
   --crimson:#B8213A; --neon:#FF2A3B; --green:#0F9D58; --green-2:#13B36A;
   --purple:#7C3AED; --ink:#2A1F12; --ink-2:#4A3B24; --ink-soft:#6B5A3E;
-  --vfx-cyan:#00E5FF; --vfx-magenta:#FF00E5; --vfx-gold:#FFD700;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{margin:0;padding:0;overflow-x:hidden}
@@ -563,146 +736,70 @@ body{
     radial-gradient(ellipse at 15% 8%, #FFF9EC 0%, transparent 45%),
     radial-gradient(ellipse at 85% 92%, #F0E0C8 0%, transparent 50%),
     linear-gradient(180deg, var(--ivory) 0%, var(--ivory-2) 100%);
-  background-attachment:fixed;
-  color:var(--ink);
-  font-family:'Plus Jakarta Sans',sans-serif;
-  min-height:100vh;
-  position:relative;
-  overflow-x:hidden;
+  background-attachment:fixed;color:var(--ink);
+  font-family:'Plus Jakarta Sans',sans-serif;min-height:100vh;position:relative;overflow-x:hidden;
 }
-
-/* ═══ VFX LAYER 1: Aurora Borealis ═══ */
-#aurora{
-  position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.55;
+#aurora{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.55;
   background:
     conic-gradient(from 0deg at 20% 30%, transparent 0deg, rgba(201,162,39,.15) 60deg, transparent 120deg),
-    conic-gradient(from 180deg at 80% 70%, transparent 0deg, rgba(184,33,58,.12) 60deg, transparent 120deg),
-    conic-gradient(from 90deg at 50% 50%, transparent 0deg, rgba(124,58,237,.08) 90deg, transparent 180deg);
-  animation:auroraSpin 30s linear infinite;
-  mix-blend-mode:multiply;
-}
+    conic-gradient(from 180deg at 80% 70%, transparent 0deg, rgba(184,33,58,.12) 60deg, transparent 120deg);
+  animation:auroraSpin 30s linear infinite;mix-blend-mode:multiply}
 @keyframes auroraSpin{0%{transform:rotate(0deg) scale(1.2)}100%{transform:rotate(360deg) scale(1.2)}}
-
-/* ═══ VFX LAYER 2: Plasma Grid ═══ */
-#plasma{
-  position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.35;
-  background-image:
-    linear-gradient(rgba(201,162,39,.08) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(201,162,39,.08) 1px, transparent 1px);
-  background-size:40px 40px;
-  animation:plasmaMove 20s linear infinite;
+#plasma{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.35;
+  background-image:linear-gradient(rgba(201,162,39,.08) 1px, transparent 1px),linear-gradient(90deg, rgba(201,162,39,.08) 1px, transparent 1px);
+  background-size:40px 40px;animation:plasmaMove 20s linear infinite;
   mask-image:radial-gradient(ellipse at center, black 30%, transparent 80%);
-  -webkit-mask-image:radial-gradient(ellipse at center, black 30%, transparent 80%);
-}
+  -webkit-mask-image:radial-gradient(ellipse at center, black 30%, transparent 80%)}
 @keyframes plasmaMove{0%{background-position:0 0}100%{background-position:40px 40px}}
-
-/* ═══ VFX LAYER 3: Canvas Particles ═══ */
 #particles{position:fixed;inset:0;z-index:1;pointer-events:none;opacity:.65}
-
-/* ═══ VFX LAYER 4: Scanlines ═══ */
-body::after{
-  content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;
   background:repeating-linear-gradient(0deg, transparent 0px, transparent 2px, rgba(42,31,18,.015) 2px, rgba(42,31,18,.015) 3px);
-  mix-blend-mode:multiply;
-}
-
+  mix-blend-mode:multiply}
 .wrap{position:relative;z-index:10;max-width:1500px;margin:0 auto;padding:16px}
-
-/* ═══════════ HEADER with HOLOGRAPHIC effect ═══════════ */
-header{
-  display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;
+header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;
   gap:14px;padding:20px 26px;
   background:linear-gradient(135deg, #FFFCF4 0%, var(--ivory-2) 50%, var(--ivory-3) 100%);
-  border:2px solid var(--gold);
-  border-radius:24px;
-  box-shadow:
-    0 14px 48px rgba(107,15,26,.18),
-    0 5px 0 var(--gold-deep),
-    inset 0 1px 0 rgba(255,255,255,.95),
-    inset 0 -3px 20px rgba(201,162,39,.18);
-  position:relative;overflow:hidden;
-  animation:headerGlow 4s ease-in-out infinite;
-}
+  border:2px solid var(--gold);border-radius:24px;
+  box-shadow:0 14px 48px rgba(107,15,26,.18), 0 5px 0 var(--gold-deep), inset 0 1px 0 rgba(255,255,255,.95), inset 0 -3px 20px rgba(201,162,39,.18);
+  position:relative;overflow:hidden;animation:headerGlow 4s ease-in-out infinite}
 @keyframes headerGlow{
   0%,100%{box-shadow:0 14px 48px rgba(107,15,26,.18), 0 5px 0 var(--gold-deep), inset 0 1px 0 rgba(255,255,255,.95), inset 0 -3px 20px rgba(201,162,39,.18)}
-  50%{box-shadow:0 14px 58px rgba(201,162,39,.35), 0 5px 0 var(--gold-deep), inset 0 1px 0 rgba(255,255,255,.95), inset 0 -3px 30px rgba(224,188,63,.28)}
-}
-header::before{
-  content:'';position:absolute;inset:0;
+  50%{box-shadow:0 14px 58px rgba(201,162,39,.35), 0 5px 0 var(--gold-deep), inset 0 1px 0 rgba(255,255,255,.95), inset 0 -3px 30px rgba(224,188,63,.28)}}
+header::before{content:'';position:absolute;inset:0;
   background:linear-gradient(120deg, transparent 20%, rgba(255,255,255,.5) 50%, transparent 80%);
-  transform:translateX(-100%);
-  animation:holographic 6s ease-in-out infinite;
-}
-@keyframes holographic{
-  0%{transform:translateX(-100%)}
-  60%,100%{transform:translateX(100%)}
-}
-header::after{
-  content:'';position:absolute;left:0;right:0;top:0;height:3px;
+  transform:translateX(-100%);animation:holographic 6s ease-in-out infinite}
+@keyframes holographic{0%{transform:translateX(-100%)}60%,100%{transform:translateX(100%)}}
+header::after{content:'';position:absolute;left:0;right:0;top:0;height:3px;
   background:linear-gradient(90deg, var(--gold-deep), var(--gold-bright), var(--crimson), var(--gold-bright), var(--gold-deep));
-  background-size:300% 100%;
-  animation:flow 5s linear infinite;
-}
+  background-size:300% 100%;animation:flow 5s linear infinite}
 @keyframes flow{0%{background-position:0% 0%}100%{background-position:300% 0%}}
-
 .brand{display:flex;align-items:center;gap:16px;position:relative;z-index:2}
-.brain{
-  width:62px;height:62px;border-radius:50%;
-  display:flex;align-items:center;justify-content:center;
+.brain{width:62px;height:62px;border-radius:50%;display:flex;align-items:center;justify-content:center;
   background:radial-gradient(circle at 30% 30%, var(--maroon-2), var(--maroon-3));
   border:3px solid var(--gold);
-  box-shadow:
-    0 0 0 3px var(--ivory),
-    0 0 30px rgba(184,33,58,.5),
-    0 0 60px rgba(201,162,39,.3),
-    0 8px 20px rgba(0,0,0,.25),
-    inset 0 0 20px rgba(0,0,0,.5);
-  animation:brainPulse 2.5s infinite ease-in-out;
-  position:relative;
-}
+  box-shadow:0 0 0 3px var(--ivory), 0 0 30px rgba(184,33,58,.5), 0 0 60px rgba(201,162,39,.3), 0 8px 20px rgba(0,0,0,.25), inset 0 0 20px rgba(0,0,0,.5);
+  animation:brainPulse 2.5s infinite ease-in-out;position:relative}
 @keyframes brainPulse{
-  0%,100%{
-    box-shadow:0 0 0 3px var(--ivory), 0 0 30px rgba(184,33,58,.5), 0 0 60px rgba(201,162,39,.3), 0 8px 20px rgba(0,0,0,.25), inset 0 0 20px rgba(0,0,0,.5);
-    transform:scale(1);
-  }
-  50%{
-    box-shadow:0 0 0 3px var(--ivory), 0 0 50px rgba(184,33,58,.7), 0 0 90px rgba(224,188,63,.5), 0 8px 20px rgba(0,0,0,.25), inset 0 0 20px rgba(0,0,0,.5);
-    transform:scale(1.05);
-  }
-}
-.brain::before{
-  content:'';position:absolute;inset:-8px;border-radius:50%;
-  border:2px dashed rgba(201,162,39,.5);
-  animation:rotateSlow 12s linear infinite;
-}
+  0%,100%{box-shadow:0 0 0 3px var(--ivory), 0 0 30px rgba(184,33,58,.5), 0 0 60px rgba(201,162,39,.3), 0 8px 20px rgba(0,0,0,.25), inset 0 0 20px rgba(0,0,0,.5);transform:scale(1)}
+  50%{box-shadow:0 0 0 3px var(--ivory), 0 0 50px rgba(184,33,58,.7), 0 0 90px rgba(224,188,63,.5), 0 8px 20px rgba(0,0,0,.25), inset 0 0 20px rgba(0,0,0,.5);transform:scale(1.05)}}
+.brain::before{content:'';position:absolute;inset:-8px;border-radius:50%;
+  border:2px dashed rgba(201,162,39,.5);animation:rotateSlow 12s linear infinite}
 @keyframes rotateSlow{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
-.brain i{
-  font-size:30px;color:var(--gold-bright);
+.brain i{font-size:30px;color:var(--gold-bright);
   text-shadow:0 0 15px rgba(224,188,63,1), 0 0 30px rgba(224,188,63,.7);
-  animation:iconPulse 1.5s ease-in-out infinite;
-}
+  animation:iconPulse 1.5s ease-in-out infinite}
 @keyframes iconPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.15)}}
-
-.brand h1{
-  font-family:'Orbitron',sans-serif;font-weight:900;letter-spacing:2.5px;font-size:28px;
+.brand h1{font-family:'Orbitron',sans-serif;font-weight:900;letter-spacing:2.5px;font-size:28px;
   background:linear-gradient(135deg, var(--maroon-2) 0%, var(--gold-deep) 50%, var(--maroon-2) 100%);
-  background-size:200% 200%;
-  -webkit-background-clip:text;background-clip:text;color:transparent;
-  text-shadow:0 2px 6px rgba(0,0,0,.08);
-  animation:titleShine 4s ease-in-out infinite;
-}
+  background-size:200% 200%;-webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:titleShine 4s ease-in-out infinite}
 @keyframes titleShine{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
 .brand p{font-size:11px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;letter-spacing:.8px;margin-top:2px}
-
 .status-pills{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;position:relative;z-index:2;align-items:center}
-.pill{
-  display:flex;align-items:center;gap:8px;padding:10px 15px;border-radius:12px;
-  background:linear-gradient(180deg, #FFFDF8, var(--ivory));
-  border:1.5px solid var(--gold);
+.pill{display:flex;align-items:center;gap:8px;padding:10px 15px;border-radius:12px;
+  background:linear-gradient(180deg, #FFFDF8, var(--ivory));border:1.5px solid var(--gold);
   box-shadow:0 3px 0 var(--ivory-4), inset 0 1px 0 #fff, 0 4px 12px rgba(201,162,39,.15);
-  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-2);
-  transition:all .3s;
-}
+  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-2);transition:all .3s}
 .pill:hover{transform:translateY(-2px);box-shadow:0 6px 0 var(--ivory-4), inset 0 1px 0 #fff, 0 8px 20px rgba(201,162,39,.25)}
 .pill i{color:var(--maroon-2);font-size:13px}
 .pill b{color:var(--maroon-3);font-weight:700;margin-left:2px}
@@ -714,471 +811,137 @@ header::after{
 .live-dot{width:9px;height:9px;border-radius:50%;background:var(--green);
   box-shadow:0 0 0 0 rgba(15,157,88,.7);animation:livePulse 1.8s infinite}
 @keyframes livePulse{0%{box-shadow:0 0 0 0 rgba(15,157,88,.7)}70%{box-shadow:0 0 0 12px rgba(15,157,88,0)}100%{box-shadow:0 0 0 0 rgba(15,157,88,0)}}
-
-/* ═══════════ TTS BUTTON ═══════════ */
-.tts-btn{
-  display:flex;align-items:center;gap:8px;padding:10px 16px;border-radius:12px;
-  background:linear-gradient(135deg, var(--maroon-2), var(--maroon-3));
-  color:#fff;border:2px solid var(--gold);
+.tts-btn{display:flex;align-items:center;gap:8px;padding:10px 16px;border-radius:12px;
+  background:linear-gradient(135deg, var(--maroon-2), var(--maroon-3));color:#fff;border:2px solid var(--gold);
   cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;
   letter-spacing:1px;text-transform:uppercase;
   box-shadow:0 4px 0 var(--maroon-3), inset 0 1px 0 rgba(255,255,255,.2), 0 6px 20px rgba(139,20,32,.3);
-  transition:all .25s cubic-bezier(.34,1.56,.64,1);
-  position:relative;overflow:hidden;
-}
-.tts-btn:hover{transform:translateY(-3px);box-shadow:0 7px 0 var(--maroon-3), inset 0 1px 0 rgba(255,255,255,.2), 0 12px 30px rgba(139,20,32,.5)}
-.tts-btn:active{transform:translateY(1px);box-shadow:0 1px 0 var(--maroon-3)}
-.tts-btn.on{background:linear-gradient(135deg, var(--green-2), var(--green));border-color:#86EFAC;box-shadow:0 4px 0 #065F46, inset 0 1px 0 rgba(255,255,255,.3), 0 6px 20px rgba(15,157,88,.4)}
-.tts-btn.on:hover{box-shadow:0 7px 0 #065F46, 0 12px 30px rgba(15,157,88,.6)}
-.tts-btn i{font-size:14px}
-.tts-btn::after{
-  content:'';position:absolute;inset:0;background:linear-gradient(90deg, transparent, rgba(255,255,255,.4), transparent);
-  transform:translateX(-100%);
-}
-.tts-btn:hover::after{animation:btnShine 0.8s}
-@keyframes btnShine{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
-
-/* ═══════════ HERO ═══════════ */
-.hero{
-  margin-top:20px;padding:28px;border-radius:26px;
+  transition:all .25s cubic-bezier(.34,1.56,.64,1);position:relative;overflow:hidden}
+.tts-btn:hover{transform:translateY(-3px)}
+.tts-btn.on{background:linear-gradient(135deg, var(--green-2), var(--green));border-color:#86EFAC}
+.hero{margin-top:20px;padding:28px;border-radius:26px;
   background:linear-gradient(135deg, #FFFCF3 0%, var(--ivory-2) 40%, var(--ivory-3) 100%);
   border:2px solid var(--gold);
-  box-shadow:
-    0 18px 55px rgba(107,15,26,.18),
-    0 6px 0 var(--gold-deep),
-    inset 0 1px 0 #fff,
-    inset 0 0 100px rgba(201,162,39,.08);
-  position:relative;overflow:hidden;
-}
-.hero::before{
-  content:'';position:absolute;inset:0;pointer-events:none;
-  background-image:
-    linear-gradient(rgba(201,162,39,.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(201,162,39,.06) 1px, transparent 1px);
-  background-size:28px 28px;
-  animation:gridMove 15s linear infinite;
+  box-shadow:0 18px 55px rgba(107,15,26,.18), 0 6px 0 var(--gold-deep), inset 0 1px 0 #fff, inset 0 0 100px rgba(201,162,39,.08);
+  position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;inset:0;pointer-events:none;
+  background-image:linear-gradient(rgba(201,162,39,.06) 1px, transparent 1px),linear-gradient(90deg, rgba(201,162,39,.06) 1px, transparent 1px);
+  background-size:28px 28px;animation:gridMove 15s linear infinite;
   mask-image:radial-gradient(ellipse at top, black 20%, transparent 75%);
-  -webkit-mask-image:radial-gradient(ellipse at top, black 20%, transparent 75%);
-}
+  -webkit-mask-image:radial-gradient(ellipse at top, black 20%, transparent 75%)}
 @keyframes gridMove{0%{background-position:0 0}100%{background-position:28px 28px}}
-
-.hero-title{
-  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
-  margin-bottom:20px;position:relative;z-index:2;
-}
-.tag{
-  background:linear-gradient(135deg, var(--maroon-2) 0%, var(--maroon) 100%);
+.hero-title{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:20px;position:relative;z-index:2}
+.tag{background:linear-gradient(135deg, var(--maroon-2) 0%, var(--maroon) 100%);
   color:#fff;font-size:11px;font-weight:800;letter-spacing:1.8px;
-  padding:8px 16px;border-radius:99px;text-transform:uppercase;
-  font-family:'JetBrains Mono',monospace;
-  box-shadow:0 4px 14px rgba(139,20,32,.4), inset 0 1px 0 rgba(255,255,255,.2), inset 0 -2px 6px rgba(0,0,0,.2);
-  border:1px solid rgba(201,162,39,.5);
-  transition:all .3s;
-}
-.tag:hover{transform:translateY(-2px)}
-.tag.gold{
-  background:linear-gradient(135deg, var(--gold-deep) 0%, var(--gold) 50%, var(--gold-deep) 100%);
-  color:var(--maroon-3);
-  box-shadow:0 4px 14px rgba(143,114,17,.5), inset 0 1px 0 rgba(255,255,255,.5), inset 0 -2px 6px rgba(0,0,0,.15);
-}
-
-.issue-info{
-  display:flex;flex-wrap:wrap;align-items:center;gap:26px;
+  padding:8px 16px;border-radius:99px;text-transform:uppercase;font-family:'JetBrains Mono',monospace;
+  box-shadow:0 4px 14px rgba(139,20,32,.4), inset 0 1px 0 rgba(255,255,255,.2);
+  border:1px solid rgba(201,162,39,.5);transition:all .3s}
+.tag.gold{background:linear-gradient(135deg, var(--gold-deep) 0%, var(--gold) 50%, var(--gold-deep) 100%);color:var(--maroon-3)}
+.issue-info{display:flex;flex-wrap:wrap;align-items:center;gap:26px;
   font-family:'JetBrains Mono',monospace;font-size:12px;
   padding:16px 22px;margin-bottom:22px;
   background:linear-gradient(180deg, #FFFDF8, var(--ivory));
   border:1.5px solid var(--ivory-4);border-radius:16px;
   box-shadow:inset 0 2px 6px rgba(184,165,130,.15), 0 4px 14px rgba(42,31,18,.05);
-  position:relative;z-index:2;
-}
+  position:relative;z-index:2}
 .issue-info .lbl{color:var(--ink-soft);font-size:10px;letter-spacing:1.5px;font-weight:800;margin-bottom:3px}
 .issue-info .val{color:var(--maroon-3);font-weight:800;font-size:13px}
 .issue-info .val.gold{color:var(--gold-deep);font-size:14px}
 .issue-info .val.purple{color:var(--purple);font-size:13px}
-
-/* ═══════════ 3 PREDICTION CARDS with ULTRA VFX ═══════════ */
-.cards3{
-  display:grid;grid-template-columns:repeat(auto-fit, minmax(290px, 1fr));
-  gap:20px;margin-top:10px;position:relative;z-index:2;
-}
-
-.pred-card{
-  padding:24px;border-radius:22px;text-align:center;
+.cards3{display:grid;grid-template-columns:repeat(auto-fit, minmax(290px, 1fr));gap:20px;margin-top:10px;position:relative;z-index:2}
+.pred-card{padding:24px;border-radius:22px;text-align:center;
   background:linear-gradient(180deg, #FFFDF8 0%, var(--ivory) 100%);
   border:2px solid var(--ivory-4);
-  box-shadow:
-    0 10px 28px rgba(42,31,18,.1),
-    0 4px 0 var(--ivory-dark),
-    inset 0 1px 0 #fff;
-  position:relative;overflow:hidden;
-  transition:transform .45s cubic-bezier(.34,1.56,.64,1), box-shadow .45s;
-  transform-style:preserve-3d;
-  perspective:1000px;
-}
-.pred-card:hover{
-  transform:translateY(-8px) scale(1.03) rotateX(2deg);
-  box-shadow:0 25px 55px rgba(42,31,18,.22), 0 4px 0 var(--ivory-dark), inset 0 1px 0 #fff;
-}
-/* Holographic shimmer overlay */
-.pred-card::before{
-  content:'';position:absolute;top:0;left:0;right:0;height:5px;
+  box-shadow:0 10px 28px rgba(42,31,18,.1), 0 4px 0 var(--ivory-dark), inset 0 1px 0 #fff;
+  position:relative;overflow:hidden;transition:transform .45s cubic-bezier(.34,1.56,.64,1), box-shadow .45s}
+.pred-card:hover{transform:translateY(-8px) scale(1.03)}
+.pred-card::before{content:'';position:absolute;top:0;left:0;right:0;height:5px;
   background:linear-gradient(90deg, var(--gold-deep), var(--gold-bright), var(--gold-deep));
-  background-size:200% 100%;animation:flow 3s linear infinite;
-}
-.pred-card::after{
-  content:'';position:absolute;inset:0;pointer-events:none;
-  background:linear-gradient(135deg, transparent 30%, rgba(255,255,255,.4) 50%, transparent 70%);
-  transform:translateX(-150%);
-  animation:cardShine 5s ease-in-out infinite;
-}
-@keyframes cardShine{0%,100%{transform:translateX(-150%)}50%{transform:translateX(150%)}}
-
-.pred-card.r1{
-  border-color:var(--gold);
-  box-shadow:0 12px 35px rgba(201,162,39,.3), 0 4px 0 var(--gold-deep), inset 0 1px 0 #fff, inset 0 0 60px rgba(224,188,63,.08);
-  animation:cardPulseGold 3s ease-in-out infinite;
-}
-@keyframes cardPulseGold{
-  0%,100%{box-shadow:0 12px 35px rgba(201,162,39,.3), 0 4px 0 var(--gold-deep), inset 0 1px 0 #fff, inset 0 0 60px rgba(224,188,63,.08)}
-  50%{box-shadow:0 12px 45px rgba(224,188,63,.5), 0 4px 0 var(--gold-deep), inset 0 1px 0 #fff, inset 0 0 80px rgba(224,188,63,.15)}
-}
-.pred-card.r1::before{background:linear-gradient(90deg, var(--gold-deep), #FFD966, var(--gold-bright), #FFD966, var(--gold-deep));background-size:300% 100%;animation:flow 4s linear infinite}
-.pred-card.r2{
-  border-color:var(--crimson);
-  box-shadow:0 12px 35px rgba(184,33,58,.28), 0 4px 0 #8B1420, inset 0 1px 0 #fff, inset 0 0 60px rgba(184,33,58,.06);
-}
-.pred-card.r2::before{background:linear-gradient(90deg, var(--maroon-2), var(--crimson), var(--neon), var(--crimson), var(--maroon-2));background-size:300% 100%;animation:flow 4s linear infinite}
-.pred-card.r3{
-  border-color:var(--purple);
-  box-shadow:0 12px 35px rgba(124,58,237,.26), 0 4px 0 #5B21B6, inset 0 1px 0 #fff, inset 0 0 60px rgba(124,58,237,.06);
-}
-.pred-card.r3::before{background:linear-gradient(90deg, #5B21B6, var(--purple), #A78BFA, var(--purple), #5B21B6);background-size:300% 100%;animation:flow 4s linear infinite}
-
-.medal{
-  position:absolute;top:14px;right:14px;
-  width:42px;height:42px;border-radius:50%;
+  background-size:200% 100%;animation:flow 3s linear infinite}
+.pred-card.r1{border-color:var(--gold);box-shadow:0 12px 35px rgba(201,162,39,.3), 0 4px 0 var(--gold-deep)}
+.pred-card.r2{border-color:var(--crimson);box-shadow:0 12px 35px rgba(184,33,58,.28), 0 4px 0 #8B1420}
+.pred-card.r3{border-color:var(--purple);box-shadow:0 12px 35px rgba(124,58,237,.26), 0 4px 0 #5B21B6}
+.medal{position:absolute;top:14px;right:14px;width:42px;height:42px;border-radius:50%;
   display:flex;align-items:center;justify-content:center;
-  font-family:'Orbitron',sans-serif;font-weight:900;font-size:16px;
-  box-shadow:0 5px 12px rgba(0,0,0,.2), inset 0 2px 0 rgba(255,255,255,.7), inset 0 -3px 6px rgba(0,0,0,.2);
-  z-index:3;
-}
+  font-family:'Orbitron',sans-serif;font-weight:900;font-size:16px;z-index:3}
 .pred-card.r1 .medal{background:linear-gradient(135deg, #FFD966, var(--gold-deep));color:#4A3300}
 .pred-card.r2 .medal{background:linear-gradient(135deg, #E0C8A0, #A08866);color:#3A2810}
 .pred-card.r3 .medal{background:linear-gradient(135deg, #C4B5FD, #7C3AED);color:#2E1065}
-
-.rank{
-  font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:2.5px;
-  margin-bottom:16px;font-weight:800;text-transform:uppercase;
-}
-.rank.r1{color:var(--gold-deep)}
-.rank.r2{color:var(--maroon-2)}
-.rank.r3{color:var(--purple)}
-
-/* ═══ BIG DIGIT with GLITCH effect ═══ */
-.digit{
-  font-family:'Orbitron',sans-serif;font-weight:900;font-size:96px;line-height:1;
-  margin:14px 0 20px;position:relative;
-  display:inline-block;letter-spacing:-3px;
-}
-.pred-card.r1 .digit{
-  color:var(--gold-deep);
-  text-shadow:
-    0 0 25px rgba(201,162,39,.6),
-    0 5px 0 var(--gold),
-    0 9px 15px rgba(42,31,18,.2);
-  animation:digitGlow 2s ease-in-out infinite;
-}
-@keyframes digitGlow{
-  0%,100%{filter:brightness(1) drop-shadow(0 0 15px rgba(201,162,39,.5))}
-  50%{filter:brightness(1.25) drop-shadow(0 0 25px rgba(224,188,63,.9))}
-}
-.pred-card.r2 .digit{
-  color:var(--maroon-2);
-  text-shadow:0 0 25px rgba(184,33,58,.5), 0 5px 0 var(--crimson), 0 9px 15px rgba(42,31,18,.2);
-}
-.pred-card.r3 .digit{
-  color:var(--purple);
-  text-shadow:0 0 25px rgba(124,58,237,.5), 0 5px 0 #5B21B6, 0 9px 15px rgba(42,31,18,.2);
-}
-
-/* Glitch flicker on new prediction */
-.digit.flash-glitch{
-  animation:glitch 0.6s ease-out;
-}
-@keyframes glitch{
-  0%{transform:translate(0) skew(0);filter:brightness(1)}
-  15%{transform:translate(-3px,2px) skew(-2deg);filter:brightness(1.8) hue-rotate(20deg)}
-  30%{transform:translate(3px,-2px) skew(2deg);filter:brightness(1.5) hue-rotate(-20deg)}
-  45%{transform:translate(-2px,1px) skew(-1deg);filter:brightness(1.7)}
-  60%{transform:translate(2px,-1px) skew(1deg);filter:brightness(1.3)}
-  100%{transform:translate(0) skew(0);filter:brightness(1)}
-}
-
-.bsc{
-  display:flex;justify-content:center;gap:10px;flex-wrap:wrap;
-  font-family:'JetBrains Mono',monospace;font-size:12px;margin-bottom:16px;
-}
-.chip{
-  padding:7px 16px;border-radius:10px;font-weight:900;letter-spacing:.8px;
-  box-shadow:0 3px 0 rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.4), inset 0 -1px 3px rgba(0,0,0,.15);
-  text-shadow:0 1px 2px rgba(0,0,0,.2);
-  transition:all .3s;
-}
-.chip:hover{transform:translateY(-2px) scale(1.05)}
+.rank{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:2.5px;margin-bottom:16px;font-weight:800;text-transform:uppercase}
+.rank.r1{color:var(--gold-deep)}.rank.r2{color:var(--maroon-2)}.rank.r3{color:var(--purple)}
+.digit{font-family:'Orbitron',sans-serif;font-weight:900;font-size:96px;line-height:1;margin:14px 0 20px;position:relative;display:inline-block;letter-spacing:-3px}
+.pred-card.r1 .digit{color:var(--gold-deep);text-shadow:0 0 25px rgba(201,162,39,.6), 0 5px 0 var(--gold), 0 9px 15px rgba(42,31,18,.2);animation:digitGlow 2s ease-in-out infinite}
+@keyframes digitGlow{0%,100%{filter:brightness(1) drop-shadow(0 0 15px rgba(201,162,39,.5))}50%{filter:brightness(1.25) drop-shadow(0 0 25px rgba(224,188,63,.9))}}
+.pred-card.r2 .digit{color:var(--maroon-2);text-shadow:0 0 25px rgba(184,33,58,.5), 0 5px 0 var(--crimson)}
+.pred-card.r3 .digit{color:var(--purple);text-shadow:0 0 25px rgba(124,58,237,.5), 0 5px 0 #5B21B6}
+.digit.flash-glitch{animation:glitch 0.6s ease-out}
+@keyframes glitch{0%{transform:translate(0);filter:brightness(1)}15%{transform:translate(-3px,2px);filter:brightness(1.8)}30%{transform:translate(3px,-2px);filter:brightness(1.5)}45%{transform:translate(-2px,1px);filter:brightness(1.7)}100%{transform:translate(0);filter:brightness(1)}}
+.bsc{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;font-family:'JetBrains Mono',monospace;font-size:12px;margin-bottom:16px}
+.chip{padding:7px 16px;border-radius:10px;font-weight:900;letter-spacing:.8px;box-shadow:0 3px 0 rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.4)}
 .chip.big{background:linear-gradient(180deg, var(--crimson), var(--maroon-2));color:#fff}
 .chip.small{background:linear-gradient(180deg, var(--green-2), var(--green));color:#fff}
 .chip.red{background:linear-gradient(180deg, var(--crimson), var(--maroon-2));color:#fff}
 .chip.green{background:linear-gradient(180deg, var(--green-2), var(--green));color:#fff}
 .chip.violet{background:linear-gradient(180deg, #A78BFA, var(--purple));color:#fff}
-
-/* ═══ CONFIDENCE BAR with LIQUID animation ═══ */
-.conf-bar{
-  height:12px;border-radius:8px;
-  background:linear-gradient(180deg, #E8DCC0, var(--ivory-4));
-  box-shadow:inset 0 2px 5px rgba(42,31,18,.18);
-  overflow:hidden;margin-top:14px;position:relative;
-}
-.conf-fill{
-  height:100%;border-radius:8px;
-  background:linear-gradient(90deg, var(--maroon-2), var(--gold-bright), var(--crimson), var(--gold-bright), var(--maroon-2));
-  background-size:300% 100%;
-  animation:confShine 3s linear infinite;
-  transition:width 1.4s cubic-bezier(.4,0,.2,1);
-  box-shadow:0 0 18px rgba(201,162,39,.6), inset 0 1px 0 rgba(255,255,255,.5);
-  position:relative;overflow:hidden;
-}
-.conf-fill::after{
-  content:'';position:absolute;inset:0;
-  background:linear-gradient(90deg, transparent, rgba(255,255,255,.5), transparent);
-  animation:liquidFlow 2s linear infinite;
-}
+.conf-bar{height:12px;border-radius:8px;background:linear-gradient(180deg, #E8DCC0, var(--ivory-4));box-shadow:inset 0 2px 5px rgba(42,31,18,.18);overflow:hidden;margin-top:14px;position:relative}
+.conf-fill{height:100%;border-radius:8px;background:linear-gradient(90deg, var(--maroon-2), var(--gold-bright), var(--crimson), var(--gold-bright), var(--maroon-2));background-size:300% 100%;animation:confShine 3s linear infinite;transition:width 1.4s cubic-bezier(.4,0,.2,1);box-shadow:0 0 18px rgba(201,162,39,.6);position:relative;overflow:hidden}
+.conf-fill::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg, transparent, rgba(255,255,255,.5), transparent);animation:liquidFlow 2s linear infinite}
 @keyframes confShine{0%{background-position:0% 0%}100%{background-position:300% 0%}}
 @keyframes liquidFlow{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
-
-.conf-txt{
-  font-family:'JetBrains Mono',monospace;font-size:11px;
-  color:var(--ink-2);margin-top:10px;font-weight:800;
-  letter-spacing:.5px;
-}
-
-/* ═══════════ STATS GRID ═══════════ */
-.grid-stat{
-  display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));
-  gap:16px;margin-top:26px;
-}
-.stat{
-  padding:22px;border-radius:20px;
-  background:linear-gradient(180deg, #FFFDF8, var(--ivory));
-  border:1.5px solid var(--ivory-4);
-  box-shadow:0 8px 22px rgba(42,31,18,.08), 0 4px 0 var(--ivory-dark), inset 0 1px 0 #fff;
-  transition:all .35s cubic-bezier(.34,1.56,.64,1);
-  position:relative;overflow:hidden;
-}
-.stat::before{
-  content:'';position:absolute;top:0;left:0;width:5px;height:100%;
-  background:linear-gradient(180deg, var(--gold), var(--maroon-2));
-}
-.stat::after{
-  content:'';position:absolute;top:-100%;right:-50%;width:150%;height:150%;
-  background:radial-gradient(circle, rgba(201,162,39,.15) 0%, transparent 70%);
-  transition:all .5s;opacity:0;
-}
-.stat:hover::after{opacity:1;top:-50%}
-.stat:hover{
-  transform:translateY(-5px);
-  box-shadow:0 16px 40px rgba(42,31,18,.15), 0 4px 0 var(--ivory-dark), inset 0 1px 0 #fff;
-}
-.stat-lbl{
-  font-size:11px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;
-  letter-spacing:1.5px;font-weight:800;margin-bottom:8px;position:relative;z-index:2;
-}
-.stat-val{
-  font-size:30px;font-weight:900;font-family:'Orbitron',sans-serif;
-  color:var(--maroon-3);line-height:1.1;position:relative;z-index:2;
-  transition:all .3s;
-}
-.stat-val.gold{color:var(--gold-deep)}
-.stat-val.green{color:var(--green)}
-.stat-val.red{color:var(--crimson)}
-.stat-sub{
-  font-size:10px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;
-  margin-top:6px;opacity:.8;position:relative;z-index:2;
-}
-
-/* ═══════════ PANELS ═══════════ */
+.conf-txt{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-2);margin-top:10px;font-weight:800}
+.grid-stat{display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:16px;margin-top:26px}
+.stat{padding:22px;border-radius:20px;background:linear-gradient(180deg, #FFFDF8, var(--ivory));border:1.5px solid var(--ivory-4);box-shadow:0 8px 22px rgba(42,31,18,.08), 0 4px 0 var(--ivory-dark), inset 0 1px 0 #fff;transition:all .35s;position:relative;overflow:hidden}
+.stat::before{content:'';position:absolute;top:0;left:0;width:5px;height:100%;background:linear-gradient(180deg, var(--gold), var(--maroon-2))}
+.stat:hover{transform:translateY(-5px);box-shadow:0 16px 40px rgba(42,31,18,.15), 0 4px 0 var(--ivory-dark)}
+.stat-lbl{font-size:11px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;letter-spacing:1.5px;font-weight:800;margin-bottom:8px}
+.stat-val{font-size:30px;font-weight:900;font-family:'Orbitron',sans-serif;color:var(--maroon-3);line-height:1.1}
+.stat-val.gold{color:var(--gold-deep)}.stat-val.green{color:var(--green)}.stat-val.red{color:var(--crimson)}
+.stat-sub{font-size:10px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;margin-top:6px}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:26px}
 @media(max-width:900px){.row2{grid-template-columns:1fr}}
-
-.panel{
-  padding:24px;border-radius:22px;
-  background:linear-gradient(180deg, #FFFDF8 0%, var(--ivory) 100%);
-  border:1.5px solid var(--ivory-4);
-  box-shadow:0 10px 26px rgba(42,31,18,.08), 0 4px 0 var(--ivory-dark), inset 0 1px 0 #fff;
-  position:relative;overflow:hidden;
-}
-.panel-h{
-  display:flex;align-items:center;gap:12px;margin-bottom:18px;
-  padding-bottom:16px;border-bottom:2px solid var(--ivory-3);
-  position:relative;
-}
-.panel-h::after{
-  content:'';position:absolute;bottom:-2px;left:0;width:80px;height:2px;
-  background:linear-gradient(90deg, var(--gold), var(--maroon-2), transparent);
-  animation:headingLine 3s ease-in-out infinite;
-  background-size:200% 100%;
-}
-@keyframes headingLine{0%,100%{background-position:0% 0%}50%{background-position:200% 0%}}
-.panel-h i{
-  color:var(--maroon-2);font-size:18px;padding:9px;border-radius:11px;
-  background:linear-gradient(180deg, var(--ivory-2), var(--ivory-3));
-  box-shadow:0 3px 0 var(--ivory-4), inset 0 1px 0 #fff;
-}
-.panel-h h3{
-  font-family:'Orbitron',sans-serif;font-size:13px;letter-spacing:1.8px;
-  color:var(--maroon-3);text-transform:uppercase;font-weight:800;
-}
-
-/* ═══ FREQUENCY BARS ═══ */
+.panel{padding:24px;border-radius:22px;background:linear-gradient(180deg, #FFFDF8 0%, var(--ivory) 100%);border:1.5px solid var(--ivory-4);box-shadow:0 10px 26px rgba(42,31,18,.08), 0 4px 0 var(--ivory-dark);position:relative}
+.panel-h{display:flex;align-items:center;gap:12px;margin-bottom:18px;padding-bottom:16px;border-bottom:2px solid var(--ivory-3)}
+.panel-h i{color:var(--maroon-2);font-size:18px;padding:9px;border-radius:11px;background:linear-gradient(180deg, var(--ivory-2), var(--ivory-3));box-shadow:0 3px 0 var(--ivory-4)}
+.panel-h h3{font-family:'Orbitron',sans-serif;font-size:13px;letter-spacing:1.8px;color:var(--maroon-3);text-transform:uppercase;font-weight:800}
 .freq-list{display:flex;flex-direction:column;gap:8px}
-.freq-row{
-  display:flex;align-items:center;gap:10px;
-  font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 0;
-  transition:all .3s;
-}
-.freq-row:hover{transform:translateX(4px)}
-.freq-row .num{
-  width:24px;height:24px;line-height:24px;text-align:center;color:#fff;
-  font-weight:900;border-radius:7px;
-  background:linear-gradient(180deg, var(--maroon-2), var(--maroon-3));
-  box-shadow:0 2px 0 rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.2);
-  font-size:12px;
-}
-.freq-row.hi .num{
-  background:linear-gradient(180deg, var(--gold-bright), var(--gold-deep));
-  color:#3A2810;animation:hiPulse 2s infinite;
-}
-@keyframes hiPulse{
-  0%,100%{box-shadow:0 2px 0 rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.3), 0 0 0 0 rgba(224,188,63,.5)}
-  50%{box-shadow:0 2px 0 rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.3), 0 0 0 8px rgba(224,188,63,0)}
-}
+.freq-row{display:flex;align-items:center;gap:10px;font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 0}
+.freq-row .num{width:24px;height:24px;line-height:24px;text-align:center;color:#fff;font-weight:900;border-radius:7px;background:linear-gradient(180deg, var(--maroon-2), var(--maroon-3));font-size:12px}
+.freq-row.hi .num{background:linear-gradient(180deg, var(--gold-bright), var(--gold-deep));color:#3A2810}
 .freq-row .marker{width:18px;text-align:center;color:var(--gold-deep);font-size:16px;font-weight:900}
-.freq-row .bar{
-  flex:1;height:20px;border-radius:10px;
-  background:linear-gradient(180deg, #E8DCC0, var(--ivory-4));
-  box-shadow:inset 0 2px 5px rgba(42,31,18,.18);
-  overflow:hidden;position:relative;
-}
-.freq-row .fill{
-  height:100%;border-radius:10px;
-  background:linear-gradient(90deg, var(--maroon-3), var(--maroon-2), var(--crimson));
-  transition:width 1s cubic-bezier(.4,0,.2,1);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.3);
-  position:relative;overflow:hidden;
-}
-.freq-row .fill::after{
-  content:'';position:absolute;inset:0;
-  background:linear-gradient(90deg, transparent, rgba(255,255,255,.4), transparent);
-  animation:liquidFlow 2.5s linear infinite;
-}
-.freq-row.hi .fill{
-  background:linear-gradient(90deg, var(--gold-deep), var(--gold-bright), var(--gold-deep));
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.5), 0 0 18px rgba(201,162,39,.6);
-}
+.freq-row .bar{flex:1;height:20px;border-radius:10px;background:linear-gradient(180deg, #E8DCC0, var(--ivory-4));box-shadow:inset 0 2px 5px rgba(42,31,18,.18);overflow:hidden}
+.freq-row .fill{height:100%;border-radius:10px;background:linear-gradient(90deg, var(--maroon-3), var(--maroon-2), var(--crimson));transition:width 1s}
+.freq-row.hi .fill{background:linear-gradient(90deg, var(--gold-deep), var(--gold-bright))}
 .freq-row .count{width:38px;text-align:right;color:var(--ink-2);font-weight:800}
-
-/* ═══ COLOR CARDS ═══ */
 .color-break{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-.cb{
-  padding:20px 14px;border-radius:16px;text-align:center;
-  font-family:'JetBrains Mono',monospace;border:2px solid;
-  position:relative;overflow:hidden;
-  box-shadow:0 6px 16px rgba(42,31,18,.1), inset 0 1px 0 rgba(255,255,255,.6);
-  transition:all .35s cubic-bezier(.34,1.56,.64,1);
-}
-.cb:hover{transform:translateY(-4px) scale(1.04)}
-.cb::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
-.cb::after{
-  content:'';position:absolute;inset:0;
-  background:linear-gradient(135deg, transparent 40%, rgba(255,255,255,.5) 50%, transparent 60%);
-  transform:translateX(-150%);
-}
-.cb:hover::after{animation:cardShine 1s}
+.cb{padding:20px 14px;border-radius:16px;text-align:center;font-family:'JetBrains Mono',monospace;border:2px solid;position:relative;overflow:hidden}
 .cb.red{background:linear-gradient(180deg, #FEF2F2, #FECACA);border-color:#DC2626;color:#991B1B}
-.cb.red::before{background:linear-gradient(90deg, #7F1D1D, #DC2626, #7F1D1D)}
 .cb.green{background:linear-gradient(180deg, #F0FDF4, #BBF7D0);border-color:var(--green);color:#065F46}
-.cb.green::before{background:linear-gradient(90deg, #064E3B, var(--green), #064E3B)}
 .cb.violet{background:linear-gradient(180deg, #FAF5FF, #E9D5FF);border-color:var(--purple);color:#5B21B6}
-.cb.violet::before{background:linear-gradient(90deg, #4C1D95, var(--purple), #4C1D95)}
 .cb .pct{font-size:26px;font-weight:900;font-family:'Orbitron',sans-serif;color:inherit;margin:6px 0}
 .cb .lbl{font-size:10px;letter-spacing:2.5px;margin-bottom:5px;font-weight:900}
 .cb .cnt{font-size:12px;opacity:.85;font-weight:700}
-
-/* ═══ STATISTICAL TESTS ═══ */
 .tests{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px}
-.test{
-  padding:18px;border-radius:14px;
-  background:linear-gradient(180deg, #FFFDF8, var(--ivory));
-  border:1.5px solid var(--ivory-4);
-  box-shadow:0 4px 0 var(--ivory-dark), inset 0 1px 0 #fff;
-  position:relative;overflow:hidden;transition:all .3s;
-}
-.test:hover{transform:translateY(-2px)}
-.test .name{
-  font-size:10px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;
-  margin-bottom:9px;letter-spacing:1.3px;font-weight:800;
-}
-.test .result{font-size:15px;font-weight:900;font-family:'Orbitron',sans-serif;letter-spacing:.5px}
-.test .meta{font-size:10px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;margin-top:6px;opacity:.85}
-.test.bad{background:linear-gradient(180deg, #FEF2F2, #FEE2E2);border-color:var(--crimson)}
-.test.bad .result{color:var(--crimson);animation:badPulse 1.5s infinite}
-@keyframes badPulse{0%,100%{opacity:1}50%{opacity:.6}}
-.test.good{background:linear-gradient(180deg, #F0FDF4, #DCFCE7);border-color:var(--green)}
-.test.good .result{color:var(--green)}
-
-/* ═══ WIN/LOSS ═══ */
+.test{padding:18px;border-radius:14px;background:linear-gradient(180deg, #FFFDF8, var(--ivory));border:1.5px solid var(--ivory-4);box-shadow:0 4px 0 var(--ivory-dark)}
+.test .name{font-size:10px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;margin-bottom:9px;letter-spacing:1.3px;font-weight:800}
+.test .result{font-size:15px;font-weight:900;font-family:'Orbitron',sans-serif}
+.test .meta{font-size:10px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;margin-top:6px}
+.test.bad{background:linear-gradient(180deg, #FEF2F2, #FEE2E2);border-color:var(--crimson)}.test.bad .result{color:var(--crimson)}
+.test.good{background:linear-gradient(180deg, #F0FDF4, #DCFCE7);border-color:var(--green)}.test.good .result{color:var(--green)}
 .wl-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:8px}
-.wl{
-  padding:22px 14px;border-radius:16px;text-align:center;border:2px solid;
-  box-shadow:0 6px 16px rgba(42,31,18,.1), inset 0 1px 0 rgba(255,255,255,.6);
-  position:relative;overflow:hidden;transition:all .35s cubic-bezier(.34,1.56,.64,1);
-}
-.wl:hover{transform:translateY(-4px) scale(1.04)}
-.wl::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.wl{padding:22px 14px;border-radius:16px;text-align:center;border:2px solid}
 .wl.win{background:linear-gradient(180deg, #F0FDF4, #BBF7D0);border-color:var(--green)}
-.wl.win::before{background:linear-gradient(90deg, #064E3B, var(--green), #064E3B)}
 .wl.loss{background:linear-gradient(180deg, #FEF2F2, #FECACA);border-color:var(--crimson)}
-.wl.loss::before{background:linear-gradient(90deg, #7F1D1D, var(--crimson), #7F1D1D)}
 .wl .big{font-size:40px;font-weight:900;font-family:'Orbitron',sans-serif;line-height:1}
-.wl.win .big{color:#047857;text-shadow:0 2px 8px rgba(15,157,88,.3)}
-.wl.loss .big{color:#B91C1C;text-shadow:0 2px 8px rgba(184,33,58,.3)}
+.wl.win .big{color:#047857}.wl.loss .big{color:#B91C1C}
 .wl .lbl{font-size:10px;letter-spacing:2.5px;color:var(--ink-soft);font-family:'JetBrains Mono',monospace;font-weight:900;margin-top:6px}
-
-/* ═══ HISTORY ═══ */
 .hist{max-height:420px;overflow-y:auto;margin-top:12px;padding-right:8px}
 .hist::-webkit-scrollbar{width:8px}
-.hist::-webkit-scrollbar-track{background:var(--ivory-2);border-radius:8px}
-.hist::-webkit-scrollbar-thumb{
-  background:linear-gradient(180deg, var(--maroon-2), var(--maroon-3));
-  border-radius:8px;border:2px solid var(--ivory-2);
-}
-.hist-row{
-  display:grid;grid-template-columns:1fr 58px 72px 72px 72px;gap:9px;
-  padding:12px 14px;border-radius:11px;
-  font-family:'JetBrains Mono',monospace;font-size:11px;align-items:center;
-  border-bottom:1px solid var(--ivory-3);
-  transition:all .25s;
-}
-.hist-row:hover{background:rgba(201,162,39,.08);transform:translateX(4px)}
+.hist::-webkit-scrollbar-thumb{background:linear-gradient(180deg, var(--maroon-2), var(--maroon-3));border-radius:8px}
+.hist-row{display:grid;grid-template-columns:1fr 58px 72px 72px 72px;gap:9px;padding:12px 14px;border-radius:11px;font-family:'JetBrains Mono',monospace;font-size:11px;align-items:center;border-bottom:1px solid var(--ivory-3)}
+.hist-row:hover{background:rgba(201,162,39,.08)}
 .hist-row .iss{color:var(--ink-soft);font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hist-row .n{
-  font-weight:900;color:var(--maroon-3);text-align:center;font-size:17px;
-  font-family:'Orbitron',sans-serif;text-shadow:0 1px 3px rgba(0,0,0,.15);
-}
-.hist-row .badge{
-  padding:5px 9px;border-radius:8px;font-size:10px;text-align:center;font-weight:900;
-  letter-spacing:.6px;text-transform:uppercase;
-  box-shadow:0 2px 4px rgba(0,0,0,.15), inset 0 1px 0 rgba(255,255,255,.4);
-}
+.hist-row .n{font-weight:900;color:var(--maroon-3);text-align:center;font-size:17px;font-family:'Orbitron',sans-serif}
+.hist-row .badge{padding:5px 9px;border-radius:8px;font-size:10px;text-align:center;font-weight:900;letter-spacing:.6px}
 .badge.big{background:linear-gradient(180deg, var(--crimson), var(--maroon-2));color:#fff}
 .badge.small{background:linear-gradient(180deg, var(--green-2), var(--green));color:#fff}
 .badge.red{background:linear-gradient(180deg, var(--crimson), var(--maroon-2));color:#fff}
@@ -1187,69 +950,12 @@ header::after{
 .badge.win{background:linear-gradient(180deg, var(--green-2), #047857);color:#fff}
 .badge.loss{background:linear-gradient(180deg, var(--crimson), #7F1D1D);color:#fff}
 .badge.pend{background:linear-gradient(180deg, var(--gold-bright), var(--gold-deep));color:#3A2810}
-
-/* ═══ FOOTER ═══ */
-footer{
-  margin-top:30px;padding:26px;text-align:center;
-  font-family:'JetBrains Mono',monospace;font-size:11px;
-  color:var(--ink-soft);font-weight:700;letter-spacing:.6px;
-  background:linear-gradient(180deg, transparent, rgba(201,162,39,.1));
-  border-top:2px solid var(--ivory-4);position:relative;
-}
-footer::before{
-  content:'';position:absolute;top:-2px;left:50%;transform:translateX(-50%);
-  width:140px;height:2px;
-  background:linear-gradient(90deg, transparent, var(--gold), var(--maroon-2), var(--gold), transparent);
-}
-
-/* ═══ FLASH animation ═══ */
+footer{margin-top:30px;padding:26px;text-align:center;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-soft);font-weight:700;border-top:2px solid var(--ivory-4)}
 .flash{animation:flashBg 1s ease-out}
-@keyframes flashBg{
-  0%{background-color:rgba(201,162,39,.35);transform:scale(1.015)}
-  100%{background-color:transparent;transform:scale(1)}
-}
-
-/* ═══ NOTIFICATION TOAST ═══ */
-.toast{
-  position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(120%);
-  padding:14px 24px;border-radius:14px;font-family:'JetBrains Mono',monospace;
-  font-size:12px;font-weight:700;z-index:99999;
-  background:linear-gradient(135deg, var(--maroon-2), var(--maroon-3));
-  color:#fff;border:2px solid var(--gold);
-  box-shadow:0 10px 40px rgba(139,20,32,.5), inset 0 1px 0 rgba(255,255,255,.2);
-  transition:transform .4s cubic-bezier(.34,1.56,.64,1);
-  display:flex;align-items:center;gap:10px;max-width:90vw;
-}
+@keyframes flashBg{0%{background-color:rgba(201,162,39,.35);transform:scale(1.015)}100%{background-color:transparent;transform:scale(1)}}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(120%);padding:14px 24px;border-radius:14px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;z-index:99999;background:linear-gradient(135deg, var(--maroon-2), var(--maroon-3));color:#fff;border:2px solid var(--gold);box-shadow:0 10px 40px rgba(139,20,32,.5);transition:transform .4s cubic-bezier(.34,1.56,.64,1);max-width:90vw;text-align:center}
 .toast.show{transform:translateX(-50%) translateY(0)}
-
-/* ═══ VOICE WAVES animation ═══ */
-.voice-wave{
-  display:inline-flex;gap:3px;align-items:flex-end;height:14px;
-}
-.voice-wave span{
-  width:3px;background:#fff;border-radius:2px;
-  animation:voiceWave 1s ease-in-out infinite;
-}
-.voice-wave span:nth-child(1){animation-delay:0s}
-.voice-wave span:nth-child(2){animation-delay:.15s}
-.voice-wave span:nth-child(3){animation-delay:.3s}
-.voice-wave span:nth-child(4){animation-delay:.45s}
-.voice-wave span:nth-child(5){animation-delay:.6s}
-@keyframes voiceWave{0%,100%{height:4px}50%{height:14px}}
-
-@media(max-width:640px){
-  .brand h1{font-size:22px}
-  .brand p{font-size:10px}
-  .brain{width:52px;height:52px}
-  .brain i{font-size:24px}
-  .digit{font-size:76px;letter-spacing:-2px}
-  .stat-val{font-size:22px}
-  .hero{padding:20px}
-  .panel{padding:18px}
-  .status-pills{width:100%;justify-content:center}
-  .pill{font-size:10px;padding:8px 12px}
-  .tts-btn{font-size:10px;padding:9px 12px}
-}
+@media(max-width:640px){.brand h1{font-size:22px}.digit{font-size:76px}.stat-val{font-size:22px}.hero{padding:20px}.panel{padding:18px}}
 </style>
 </head>
 <body>
@@ -1263,7 +969,7 @@ footer::before{
       <div class="brain"><i class="fa-solid fa-brain"></i></div>
       <div>
         <h1>XOMAT AI <span style="color:var(--maroon-2)">PRO</span></h1>
-        <p>v6.0 · ULTRA VFX · Voice Enabled</p>
+        <p>v7.0 · APScheduler + External Cron · AI Training</p>
       </div>
     </div>
     <div class="status-pills">
@@ -1283,7 +989,7 @@ footer::before{
         <span class="live-dot"></span>
         <b id="liveText">syncing</b>
       </div>
-      <button class="tts-btn" id="ttsBtn" onclick="toggleTTS()" title="Toggle Voice Announcements">
+      <button class="tts-btn" id="ttsBtn" onclick="toggleTTS()">
         <i class="fa-solid fa-volume-xmark" id="ttsIcon"></i>
         <span id="ttsText">Voice OFF</span>
       </button>
@@ -1294,59 +1000,29 @@ footer::before{
     <div class="hero-title">
       <span class="tag"><i class="fa-solid fa-crown"></i> Best 3 Periods</span>
       <span class="tag gold"><i class="fa-solid fa-chart-line"></i> Multi-Model Ensemble</span>
-      <span class="tag" style="background:linear-gradient(135deg,var(--purple),#5B21B6)">
-        <i class="fa-solid fa-wand-magic-sparkles"></i> Ultra VFX
+      <span class="tag" style="background:linear-gradient(135deg,var(--green),#047857)">
+        <i class="fa-solid fa-clock"></i> AUTO CRON
       </span>
     </div>
     <div class="issue-info">
       <div><div class="lbl">CURRENT ISSUE</div><div class="val" id="curIssue">—</div></div>
       <div><div class="lbl">NEXT PERIOD</div><div class="val gold" id="nextIssue">—</div></div>
       <div><div class="lbl">PATTERN</div><div class="val purple" id="patternTag">—</div></div>
+      <div><div class="lbl">CRON TICKS</div><div class="val" id="cronTicks">0</div></div>
     </div>
     <div class="cards3" id="predCards">
-      <div class="pred-card r1">
-        <div class="medal">1</div>
-        <div class="rank r1">★ RANK #1 — PRIMARY</div>
-        <div class="digit">-</div>
-        <div class="bsc"><div class="chip big">BIG</div><div class="chip red">RED</div></div>
-        <div class="conf-bar"><div class="conf-fill" style="width:0%"></div></div>
-        <div class="conf-txt">0% confidence</div>
-      </div>
-      <div class="pred-card r2">
-        <div class="medal">2</div>
-        <div class="rank r2">★ RANK #2 — SECONDARY</div>
-        <div class="digit">-</div>
-        <div class="bsc"><div class="chip big">BIG</div><div class="chip red">RED</div></div>
-        <div class="conf-bar"><div class="conf-fill" style="width:0%"></div></div>
-        <div class="conf-txt">0% confidence</div>
-      </div>
-      <div class="pred-card r3">
-        <div class="medal">3</div>
-        <div class="rank r3">★ RANK #3 — TERTIARY</div>
-        <div class="digit">-</div>
-        <div class="bsc"><div class="chip big">BIG</div><div class="chip red">RED</div></div>
-        <div class="conf-bar"><div class="conf-fill" style="width:0%"></div></div>
-        <div class="conf-txt">0% confidence</div>
-      </div>
+      <div class="pred-card r1"><div class="medal">1</div><div class="rank r1">★ RANK #1</div><div class="digit">-</div><div class="bsc"><div class="chip big">BIG</div><div class="chip red">RED</div></div><div class="conf-bar"><div class="conf-fill" style="width:0%"></div></div><div class="conf-txt">0% confidence</div></div>
+      <div class="pred-card r2"><div class="medal">2</div><div class="rank r2">★ RANK #2</div><div class="digit">-</div><div class="bsc"><div class="chip big">BIG</div><div class="chip red">RED</div></div><div class="conf-bar"><div class="conf-fill" style="width:0%"></div></div><div class="conf-txt">0% confidence</div></div>
+      <div class="pred-card r3"><div class="medal">3</div><div class="rank r3">★ RANK #3</div><div class="digit">-</div><div class="bsc"><div class="chip big">BIG</div><div class="chip red">RED</div></div><div class="conf-bar"><div class="conf-fill" style="width:0%"></div></div><div class="conf-txt">0% confidence</div></div>
     </div>
   </section>
 
   <div class="grid-stat">
-    <div class="stat"><div class="stat-lbl">TOTAL RECORDS</div>
-      <div class="stat-val" id="statTotal">0</div>
-      <div class="stat-sub">accumulated from API</div></div>
-    <div class="stat"><div class="stat-lbl">WIN RATE</div>
-      <div class="stat-val green" id="statWinRate">0%</div>
-      <div class="stat-sub">all-time accuracy</div></div>
-    <div class="stat"><div class="stat-lbl">WINS</div>
-      <div class="stat-val green" id="statWins">0</div>
-      <div class="stat-sub">successful predictions</div></div>
-    <div class="stat"><div class="stat-lbl">LOSSES</div>
-      <div class="stat-val red" id="statLosses">0</div>
-      <div class="stat-sub">failed predictions</div></div>
-    <div class="stat"><div class="stat-lbl">TOP CONFIDENCE</div>
-      <div class="stat-val gold" id="statConf">0%</div>
-      <div class="stat-sub">rank #1 signal strength</div></div>
+    <div class="stat"><div class="stat-lbl">TOTAL RECORDS</div><div class="stat-val" id="statTotal">0</div><div class="stat-sub">JSON + CSV</div></div>
+    <div class="stat"><div class="stat-lbl">WIN RATE</div><div class="stat-val green" id="statWinRate">0%</div><div class="stat-sub">all-time accuracy</div></div>
+    <div class="stat"><div class="stat-lbl">WINS</div><div class="stat-val green" id="statWins">0</div><div class="stat-sub">successful predictions</div></div>
+    <div class="stat"><div class="stat-lbl">LOSSES</div><div class="stat-val red" id="statLosses">0</div><div class="stat-sub">failed predictions</div></div>
+    <div class="stat"><div class="stat-lbl">TOP CONFIDENCE</div><div class="stat-val gold" id="statConf">0%</div><div class="stat-sub">rank #1 signal</div></div>
   </div>
 
   <div class="row2">
@@ -1363,16 +1039,8 @@ footer::before{
       </div>
       <div class="panel-h" style="margin-top:24px"><i class="fa-solid fa-flask"></i><h3>Statistical Tests</h3></div>
       <div class="tests">
-        <div class="test" id="testChi">
-          <div class="name">CHI-SQUARE</div>
-          <div class="result">—</div>
-          <div class="meta">p-value: —</div>
-        </div>
-        <div class="test" id="testRuns">
-          <div class="name">RUNS TEST</div>
-          <div class="result">—</div>
-          <div class="meta">z-score: —</div>
-        </div>
+        <div class="test" id="testChi"><div class="name">CHI-SQUARE</div><div class="result">—</div><div class="meta">p-value: —</div></div>
+        <div class="test" id="testRuns"><div class="name">RUNS TEST</div><div class="result">—</div><div class="meta">z-score: —</div></div>
       </div>
     </div>
   </div>
@@ -1385,52 +1053,41 @@ footer::before{
         <div class="wl loss"><div class="big" id="wlLosses">0</div><div class="lbl">LOSSES</div></div>
       </div>
       <div style="margin-top:18px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--ink-2)">
-        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--ivory-3)">
-          <span style="font-weight:700">Number Hits</span><b id="hitNum" style="color:var(--maroon-2);font-size:13px">0</b></div>
-        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--ivory-3)">
-          <span style="font-weight:700">Big/Small Hits</span><b id="hitBS" style="color:var(--maroon-2);font-size:13px">0</b></div>
-        <div style="display:flex;justify-content:space-between;padding:9px 0">
-          <span style="font-weight:700">Color Hits</span><b id="hitCol" style="color:var(--maroon-2);font-size:13px">0</b></div>
+        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--ivory-3)"><span style="font-weight:700">Number Hits</span><b id="hitNum" style="color:var(--maroon-2)">0</b></div>
+        <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--ivory-3)"><span style="font-weight:700">Big/Small Hits</span><b id="hitBS" style="color:var(--maroon-2)">0</b></div>
+        <div style="display:flex;justify-content:space-between;padding:9px 0"><span style="font-weight:700">Color Hits</span><b id="hitCol" style="color:var(--maroon-2)">0</b></div>
+      </div>
+      <div style="margin-top:14px;padding:12px;background:linear-gradient(180deg,#F0FDF4,#DCFCE7);border:1.5px solid var(--green);border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#065F46">
+        <div style="font-weight:900;margin-bottom:4px">📊 AI TRAINING DATA</div>
+        <div style="display:flex;justify-content:space-between;padding:2px 0"><span>CSV exists:</span><b id="csvExists">—</b></div>
+        <div style="display:flex;justify-content:space-between;padding:2px 0"><span>CSV size:</span><b id="csvSize">— MB</b></div>
+        <a href="/api/export-csv" style="display:block;margin-top:6px;padding:6px;background:#0F9D58;color:#fff;text-align:center;border-radius:6px;font-weight:900;text-decoration:none">⬇ Download CSV</a>
       </div>
     </div>
     <div class="panel">
       <div class="panel-h"><i class="fa-solid fa-list"></i><h3>Recent Draws</h3></div>
       <div class="hist">
-        <div class="hist-row" style="color:var(--ink-soft);font-size:10px;border-bottom:2px solid var(--ivory-4);font-weight:800">
-          <span>ISSUE</span><span style="text-align:center">NUM</span>
-          <span style="text-align:center">SIZE</span><span style="text-align:center">COLOR</span>
-          <span style="text-align:center">RESULT</span>
-        </div>
+        <div class="hist-row" style="color:var(--ink-soft);font-size:10px;border-bottom:2px solid var(--ivory-4);font-weight:800"><span>ISSUE</span><span style="text-align:center">NUM</span><span style="text-align:center">SIZE</span><span style="text-align:center">COLOR</span><span style="text-align:center">RESULT</span></div>
         <div id="histBody"></div>
       </div>
     </div>
   </div>
 
   <footer>
-    © 2026 XOMAT AI PRO · ULTRA VFX Edition v6.0 · Voice-Enabled · Real Statistical Engine · Auto-Sync 5s
+    © 2026 XOMAT AI PRO v7.0 · APScheduler + External Cron · AI Training CSV · Auto-Sync
   </footer>
 </div>
 
-<div class="toast" id="toast">
-  <i class="fa-solid fa-bell"></i>
-  <span id="toastText">Notification</span>
-</div>
+<div class="toast" id="toast"><span id="toastText">Notification</span></div>
 
 <script>
-/* ═══════════ PARTICLE CONSTELLATION ═══════════ */
 (function(){
   const c=document.getElementById('particles'),ctx=c.getContext('2d');
   let W,H,P=[];
   function rs(){W=c.width=innerWidth;H=c.height=innerHeight}
   rs();addEventListener('resize',rs);
   const N=Math.min(90,Math.floor(innerWidth/18));
-  for(let i=0;i<N;i++)P.push({
-    x:Math.random()*W,y:Math.random()*H,
-    vx:(Math.random()-.5)*.4,vy:(Math.random()-.5)*.4,
-    r:Math.random()*2+.8,
-    hue:Math.random()>.5?42:355,
-    a:Math.random()*.6+.3
-  });
+  for(let i=0;i<N;i++)P.push({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-.5)*.4,vy:(Math.random()-.5)*.4,r:Math.random()*2+.8,hue:Math.random()>.5?42:355,a:Math.random()*.6+.3});
   let mx=0,my=0;
   addEventListener('mousemove',e=>{mx=e.clientX;my=e.clientY});
   (function s(){
@@ -1438,20 +1095,10 @@ footer::before{
     for(let i=0;i<P.length;i++){
       for(let j=i+1;j<P.length;j++){
         const dx=P[i].x-P[j].x,dy=P[i].y-P[j].y,d2=dx*dx+dy*dy;
-        if(d2<22000){
-          ctx.strokeStyle=`hsla(${P[i].hue},70%,45%,${(1-d2/22000)*.22})`;
-          ctx.lineWidth=.8;
-          ctx.beginPath();
-          ctx.moveTo(P[i].x,P[i].y);ctx.lineTo(P[j].x,P[j].y);ctx.stroke();
-        }
+        if(d2<22000){ctx.strokeStyle=`hsla(${P[i].hue},70%,45%,${(1-d2/22000)*.22})`;ctx.lineWidth=.8;ctx.beginPath();ctx.moveTo(P[i].x,P[i].y);ctx.lineTo(P[j].x,P[j].y);ctx.stroke();}
       }
-      // Mouse connection
       const mdx=P[i].x-mx,mdy=P[i].y-my,md2=mdx*mdx+mdy*mdy;
-      if(md2<30000){
-        ctx.strokeStyle=`hsla(${P[i].hue},90%,60%,${(1-md2/30000)*.5})`;
-        ctx.lineWidth=1.2;
-        ctx.beginPath();ctx.moveTo(P[i].x,P[i].y);ctx.lineTo(mx,my);ctx.stroke();
-      }
+      if(md2<30000){ctx.strokeStyle=`hsla(${P[i].hue},90%,60%,${(1-md2/30000)*.5})`;ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(P[i].x,P[i].y);ctx.lineTo(mx,my);ctx.stroke();}
     }
     P.forEach(p=>{
       p.x+=p.vx;p.y+=p.vy;
@@ -1465,261 +1112,158 @@ footer::before{
   })();
 })();
 
-/* ═══════════ TTS ENGINE ═══════════ */
-let ttsEnabled = false;
-let lastSpokenIssue = null;
-let voiceReady = false;
-let preferredVoice = null;
-
+let ttsEnabled=false,lastSpokenIssue=null,preferredVoice=null;
 function initVoices(){
-  const voices = speechSynthesis.getVoices();
-  if(!voices.length) return;
-  voiceReady = true;
-  // Prefer English (India) or English (US) female voice
-  preferredVoice = voices.find(v => v.lang === 'en-IN') ||
-                   voices.find(v => v.lang === 'en-US' && v.name.toLowerCase().includes('female')) ||
-                   voices.find(v => v.lang === 'en-US') ||
-                   voices.find(v => v.lang.startsWith('en')) ||
-                   voices[0];
+  const voices=speechSynthesis.getVoices();
+  if(!voices.length)return;
+  preferredVoice=voices.find(v=>v.lang==='en-IN')||voices.find(v=>v.lang==='en-US'&&v.name.toLowerCase().includes('female'))||voices.find(v=>v.lang==='en-US')||voices.find(v=>v.lang.startsWith('en'))||voices[0];
 }
-speechSynthesis.onvoiceschanged = initVoices;
-initVoices();
-
+speechSynthesis.onvoiceschanged=initVoices;initVoices();
 function toggleTTS(){
-  ttsEnabled = !ttsEnabled;
-  const btn = document.getElementById('ttsBtn');
-  const icon = document.getElementById('ttsIcon');
-  const txt  = document.getElementById('ttsText');
-  if(ttsEnabled){
-    btn.classList.add('on');
-    icon.className = 'fa-solid fa-volume-high';
-    txt.textContent = 'Voice ON';
-    speak("Voice announcements enabled. XOMAT AI will now read predictions.");
-    showToast("🔊 Voice announcements turned ON");
-  } else {
-    btn.classList.remove('on');
-    icon.className = 'fa-solid fa-volume-xmark';
-    txt.textContent = 'Voice OFF';
-    speechSynthesis.cancel();
-    showToast("🔇 Voice announcements turned OFF");
-  }
+  ttsEnabled=!ttsEnabled;
+  const btn=document.getElementById('ttsBtn'),icon=document.getElementById('ttsIcon'),txt=document.getElementById('ttsText');
+  if(ttsEnabled){btn.classList.add('on');icon.className='fa-solid fa-volume-high';txt.textContent='Voice ON';speak("Voice announcements enabled.");showToast("🔊 Voice ON");}
+  else{btn.classList.remove('on');icon.className='fa-solid fa-volume-xmark';txt.textContent='Voice OFF';speechSynthesis.cancel();showToast("🔇 Voice OFF");}
 }
-
 function speak(text){
-  if(!ttsEnabled || !text) return;
+  if(!ttsEnabled||!text)return;
   speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = 'en-IN';
-  u.rate = 1.0;
-  u.pitch = 1.05;
-  u.volume = 1.0;
-  if(preferredVoice) u.voice = preferredVoice;
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang='en-IN';u.rate=1.0;u.pitch=1.05;
+  if(preferredVoice)u.voice=preferredVoice;
   speechSynthesis.speak(u);
 }
-
 function announcePrediction(a){
-  const p1 = a.periods?.[0], p2 = a.periods?.[1], p3 = a.periods?.[2];
-  if(!p1) return;
-  let text = `Next period prediction ready. `;
-  text += `Primary target: number ${p1.number}, ${p1.bs}, color ${p1.color}, confidence ${Math.round(p1.confidence)} percent. `;
-  if(p2) text += `Secondary: number ${p2.number}, ${p2.bs}. `;
-  if(p3) text += `Tertiary: number ${p3.number}. `;
-  text += `Pattern: ${a.pattern}.`;
-  speak(text);
+  const p1=a.periods?.[0],p2=a.periods?.[1],p3=a.periods?.[2];
+  if(!p1)return;
+  let t=`Next period prediction. Primary: ${p1.number}, ${p1.bs}, color ${p1.color}, ${Math.round(p1.confidence)} percent. `;
+  if(p2)t+=`Secondary: ${p2.number}, ${p2.bs}. `;
+  if(p3)t+=`Tertiary: ${p3.number}. `;
+  t+=`Pattern: ${a.pattern}.`;
+  speak(t);
 }
-
-/* ═══════════ TOAST ═══════════ */
 function showToast(msg){
-  const t = document.getElementById('toast');
-  document.getElementById('toastText').textContent = msg;
+  const t=document.getElementById('toast');
+  document.getElementById('toastText').textContent=msg;
   t.classList.add('show');
   clearTimeout(t._tid);
-  t._tid = setTimeout(()=>t.classList.remove('show'), 3000);
+  t._tid=setTimeout(()=>t.classList.remove('show'),3000);
 }
-
-/* ═══════════ HELPERS ═══════════ */
-const $ = id => document.getElementById(id);
-let LAST_ISSUE = null;
-
+const $=id=>document.getElementById(id);
+let LAST_ISSUE=null;
 function chipClass(v){
-  v = (v||'').toUpperCase();
-  if(v==='BIG') return 'chip big';
-  if(v==='SMALL') return 'chip small';
-  if(v==='RED') return 'chip red';
-  if(v==='GREEN') return 'chip green';
-  if(v==='VIOLET') return 'chip violet';
-  return 'chip';
+  v=(v||'').toUpperCase();
+  if(v==='BIG')return'chip big';if(v==='SMALL')return'chip small';
+  if(v==='RED')return'chip red';if(v==='GREEN')return'chip green';
+  if(v==='VIOLET')return'chip violet';return'chip';
 }
-
-/* ═══════════ RENDER ═══════════ */
 function render(data){
-  if(!data.ok || !data.analysis) return;
-  const a = data.analysis, s = data.stats;
-
-  const pillApi = $('pillApi');
-  if(data.online){
-    pillApi.classList.remove('offline');
-    pillApi.classList.add('live');
-    $('apiStatus').textContent = data.apiStatus || 'LIVE';
-  } else {
-    pillApi.classList.remove('live');
-    pillApi.classList.add('offline');
-    $('apiStatus').textContent = data.apiStatus || 'OFFLINE';
-  }
-
-  $('curIssue').textContent = data.lastIssue;
-  $('nextIssue').textContent = data.nextIssue;
-  $('patternTag').textContent = a.pattern;
-
-  $('statTotal').textContent = data.total;
-  $('statWinRate').textContent = s.total ? ((s.wins/s.total*100).toFixed(1)+'%') : '0%';
-  $('statWins').textContent = s.wins;
-  $('statLosses').textContent = s.losses;
-  $('statConf').textContent = (a.confidence||0).toFixed(1)+'%';
-
-  const cards = $('predCards').children;
-  const periods = a.periods || [];
+  if(!data.ok||!data.analysis)return;
+  const a=data.analysis,s=data.stats;
+  const pillApi=$('pillApi');
+  if(data.online){pillApi.classList.remove('offline');pillApi.classList.add('live');$('apiStatus').textContent=data.apiStatus||'LIVE';}
+  else{pillApi.classList.remove('live');pillApi.classList.add('offline');$('apiStatus').textContent=data.apiStatus||'OFFLINE';}
+  $('curIssue').textContent=data.lastIssue;
+  $('nextIssue').textContent=data.nextIssue;
+  $('patternTag').textContent=a.pattern;
+  $('statTotal').textContent=data.total;
+  $('statWinRate').textContent=s.total?((s.wins/s.total*100).toFixed(1)+'%'):'0%';
+  $('statWins').textContent=s.wins;
+  $('statLosses').textContent=s.losses;
+  $('statConf').textContent=(a.confidence||0).toFixed(1)+'%';
+  const cards=$('predCards').children;
+  const periods=a.periods||[];
   for(let i=0;i<3;i++){
-    const card = cards[i];
-    const p = periods[i];
-    if(!p) continue;
-    const digitEl = card.querySelector('.digit');
-    digitEl.textContent = p.number;
-    if(digitEl.textContent !== String(p.number)) digitEl.textContent = p.number;
-    const bsc = card.querySelector('.bsc');
-    bsc.innerHTML = `<div class="${chipClass(p.bs)}">${p.bs}</div>
-                     <div class="${chipClass(p.color)}">${p.color}</div>`;
-    const fill = card.querySelector('.conf-fill');
-    fill.style.width = p.confidence + '%';
-    card.querySelector('.conf-txt').textContent = p.confidence.toFixed(1) + '% confidence';
+    const card=cards[i],p=periods[i];
+    if(!p)continue;
+    const dEl=card.querySelector('.digit');
+    dEl.textContent=p.number;
+    const bsc=card.querySelector('.bsc');
+    bsc.innerHTML=`<div class="${chipClass(p.bs)}">${p.bs}</div><div class="${chipClass(p.color)}">${p.color}</div>`;
+    card.querySelector('.conf-fill').style.width=p.confidence+'%';
+    card.querySelector('.conf-txt').textContent=p.confidence.toFixed(1)+'% confidence';
   }
-
-  // Frequency
-  const freq = a.freq;
-  const maxFreq = Math.max(...freq) || 1;
-  const top1 = a.top[0], top2 = a.top[1], top3 = a.top[2];
-  let fh = '';
+  const freq=a.freq,maxFreq=Math.max(...freq)||1;
+  const top1=a.top[0],top2=a.top[1],top3=a.top[2];
+  let fh='';
   for(let i=0;i<10;i++){
-    const w = (freq[i]/maxFreq*100).toFixed(0);
-    const marker = i===top1?'★':(i===top2?'☆':(i===top3?'◆':''));
-    const cls = (i===top1||i===top2||i===top3)?'freq-row hi':'freq-row';
-    fh += `<div class="${cls}">
-      <span class="marker">${marker}</span>
-      <span class="num">${i}</span>
-      <span class="bar"><span class="fill" style="width:${w}%"></span></span>
-      <span class="count">${freq[i]}</span>
-    </div>`;
+    const w=(freq[i]/maxFreq*100).toFixed(0);
+    const marker=i===top1?'★':(i===top2?'☆':(i===top3?'◆':''));
+    const cls=(i===top1||i===top2||i===top3)?'freq-row hi':'freq-row';
+    fh+=`<div class="${cls}"><span class="marker">${marker}</span><span class="num">${i}</span><span class="bar"><span class="fill" style="width:${w}%"></span></span><span class="count">${freq[i]}</span></div>`;
   }
-  $('freqList').innerHTML = fh;
-
-  const total = (a.red+a.green+a.violet) || 1;
-  $('cbRedPct').textContent = ((a.red/total)*100).toFixed(1)+'%';
-  $('cbGreenPct').textContent = ((a.green/total)*100).toFixed(1)+'%';
-  $('cbVioletPct').textContent = ((a.violet/total)*100).toFixed(1)+'%';
-  $('cbRedCnt').textContent = a.red;
-  $('cbGreenCnt').textContent = a.green;
-  $('cbVioletCnt').textContent = a.violet;
-
-  const chi = a.chi, runs = a.runs;
-  const tChi = $('testChi');
-  tChi.className = 'test ' + (chi.biased ? 'bad' : 'good');
-  tChi.querySelector('.result').textContent = chi.biased ? '⚠ BIASED' : '✓ UNIFORM';
-  tChi.querySelector('.meta').textContent = `χ²=${chi.chi2}, p=${chi.p_value}`;
-
-  const tRuns = $('testRuns');
-  const runsBad = runs.verdict.includes('PATTERN') || runs.verdict.includes('TREND');
-  tRuns.className = 'test ' + (runsBad ? 'bad' : 'good');
-  tRuns.querySelector('.result').textContent = runs.verdict.toUpperCase();
-  tRuns.querySelector('.meta').textContent = `z=${runs.z}, p=${runs.p_value}`;
-
-  $('wlWins').textContent = s.wins;
-  $('wlLosses').textContent = s.losses;
-  $('hitNum').textContent = s.numberWins;
-  $('hitBS').textContent = s.bsWins;
-  $('hitCol').textContent = s.colorWins;
-
-  $('liveText').textContent = data.online ? 'live' : 'offline';
-
-  // Flash new prediction
-  if(data.lastIssue !== LAST_ISSUE){
-    LAST_ISSUE = data.lastIssue;
+  $('freqList').innerHTML=fh;
+  const total=(a.red+a.green+a.violet)||1;
+  $('cbRedPct').textContent=((a.red/total)*100).toFixed(1)+'%';
+  $('cbGreenPct').textContent=((a.green/total)*100).toFixed(1)+'%';
+  $('cbVioletPct').textContent=((a.violet/total)*100).toFixed(1)+'%';
+  $('cbRedCnt').textContent=a.red;$('cbGreenCnt').textContent=a.green;$('cbVioletCnt').textContent=a.violet;
+  const chi=a.chi,runs=a.runs;
+  const tChi=$('testChi');
+  tChi.className='test '+(chi.biased?'bad':'good');
+  tChi.querySelector('.result').textContent=chi.biased?'⚠ BIASED':'✓ UNIFORM';
+  tChi.querySelector('.meta').textContent=`χ²=${chi.chi2}, p=${chi.p_value}`;
+  const tRuns=$('testRuns');
+  const runsBad=runs.verdict.includes('PATTERN')||runs.verdict.includes('TREND');
+  tRuns.className='test '+(runsBad?'bad':'good');
+  tRuns.querySelector('.result').textContent=runs.verdict.toUpperCase();
+  tRuns.querySelector('.meta').textContent=`z=${runs.z}, p=${runs.p_value}`;
+  $('wlWins').textContent=s.wins;$('wlLosses').textContent=s.losses;
+  $('hitNum').textContent=s.numberWins;$('hitBS').textContent=s.bsWins;$('hitCol').textContent=s.colorWins;
+  $('liveText').textContent=data.online?'live':'offline';
+  if(data.lastIssue!==LAST_ISSUE){
+    LAST_ISSUE=data.lastIssue;
     loadHistory();
-    document.querySelectorAll('.pred-card').forEach(c=>{
-      c.classList.add('flash');
-      setTimeout(()=>c.classList.remove('flash'), 1000);
-    });
-    document.querySelectorAll('.digit').forEach(d=>{
-      d.classList.add('flash-glitch');
-      setTimeout(()=>d.classList.remove('flash-glitch'), 700);
-    });
-
-    // TTS announce only on new issues
-    if(ttsEnabled && lastSpokenIssue !== data.nextIssue){
-      lastSpokenIssue = data.nextIssue;
-      setTimeout(()=>announcePrediction(a), 500);
-    }
-
-    showToast(`🆕 New issue: ${data.lastIssue} · Next: ${data.nextIssue}`);
+    document.querySelectorAll('.pred-card').forEach(c=>{c.classList.add('flash');setTimeout(()=>c.classList.remove('flash'),1000);});
+    document.querySelectorAll('.digit').forEach(d=>{d.classList.add('flash-glitch');setTimeout(()=>d.classList.remove('flash-glitch'),700);});
+    if(ttsEnabled&&lastSpokenIssue!==data.nextIssue){lastSpokenIssue=data.nextIssue;setTimeout(()=>announcePrediction(a),500);}
+    showToast(`🆕 New issue: ${data.lastIssue}`);
   }
 }
-
-/* ═══════════ HISTORY ═══════════ */
 async function loadHistory(){
   try{
-    const r = await fetch('/api/history');
-    const d = await r.json();
-    if(!d.ok) return;
-    const rows = d.records.slice(0, 40);
-    $('histBody').innerHTML = rows.map(rec=>{
-      const sizeCls = rec.size==='BIG'?'badge big':'badge small';
-      let colorCls = 'badge ';
-      const c = (rec.color||'').split('/')[0];
-      if(c==='RED') colorCls+='red';
-      else if(c==='GREEN') colorCls+='green';
-      else colorCls+='violet';
-      let res = '<span class="badge pend">—</span>';
-      if(rec.win === true) res = '<span class="badge win">WIN</span>';
-      if(rec.win === false) res = '<span class="badge loss">LOSS</span>';
-      return `<div class="hist-row">
-        <span class="iss">${rec.issue}</span>
-        <span class="n">${rec.number}</span>
-        <span class="${sizeCls}">${rec.size}</span>
-        <span class="${colorCls}">${c||'-'}</span>
-        ${res}
-      </div>`;
+    const r=await fetch('/api/history');const d=await r.json();
+    if(!d.ok)return;
+    $('histBody').innerHTML=d.records.slice(0,40).map(rec=>{
+      const sizeCls=rec.size==='BIG'?'badge big':'badge small';
+      let colorCls='badge ';
+      const c=(rec.color||'').split('/')[0];
+      if(c==='RED')colorCls+='red';else if(c==='GREEN')colorCls+='green';else colorCls+='violet';
+      let res='<span class="badge pend">—</span>';
+      if(rec.win===true)res='<span class="badge win">WIN</span>';
+      if(rec.win===false)res='<span class="badge loss">LOSS</span>';
+      return `<div class="hist-row"><span class="iss">${rec.issue}</span><span class="n">${rec.number}</span><span class="${sizeCls}">${rec.size}</span><span class="${colorCls}">${c||'-'}</span>${res}</div>`;
     }).join('');
-  }catch(e){ console.error(e); }
+  }catch(e){}
 }
-
-/* ═══════════ POLL ═══════════ */
+async function loadDebug(){
+  try{
+    const r=await fetch('/api/debug');const d=await r.json();
+    $('cronTicks').textContent=d.cronTicks||0;
+    $('csvExists').textContent=d.csvFileExists?'✅ Yes':'❌ No';
+    $('csvSize').textContent=(d.csvFileSize?(d.csvFileSize/1024/1024).toFixed(2):'0.00')+' MB';
+  }catch(e){}
+}
 async function poll(){
   try{
-    const r = await fetch('/api/analysis');
-    const d = await r.json();
-    if(d.ok) render(d);
+    const r=await fetch('/api/analysis');const d=await r.json();
+    if(d.ok)render(d);
   }catch(e){
-    $('pillApi').classList.remove('live');
-    $('pillApi').classList.add('offline');
-    $('apiStatus').textContent = 'OFFLINE';
+    $('pillApi').classList.remove('live');$('pillApi').classList.add('offline');$('apiStatus').textContent='OFFLINE';
   }
 }
-
-/* ═══════════ CLOCK ═══════════ */
 function tick(){
-  const now = new Date();
-  const u = now.toUTCString().split(' ');
-  $('pillClock').textContent = u[4] + ' UTC';
-  const rem = 60 - now.getUTCSeconds();
-  $('pillCountdown').textContent = rem + 's';
+  const now=new Date();
+  const u=now.toUTCString().split(' ');
+  $('pillClock').textContent=u[4]+' UTC';
+  const rem=60-now.getUTCSeconds();
+  $('pillCountdown').textContent=rem+'s';
 }
-setInterval(tick,1000); tick();
-
-/* ═══════════ BOOT ═══════════ */
-setInterval(poll, 3000); poll();
+setInterval(tick,1000);tick();
+setInterval(poll,3000);poll();
+setInterval(loadDebug,5000);loadDebug();
 loadHistory();
-
-/* Welcome toast */
-setTimeout(()=>showToast("🚀 XOMAT AI PRO v6.0 ready · Tap Voice button to enable TTS"), 1200);
+setTimeout(()=>showToast("🚀 XOMAT v7.0 · Auto Cron running · Tap Voice to enable TTS"),1200);
 </script>
 </body>
 </html>
@@ -1735,7 +1279,7 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("\n" + "═"*70, flush=True)
-    print("  XOMAT AI PRO v6.0 — ULTRA VFX + TTS Edition", flush=True)
+    print("  XOMAT AI PRO v7.0 — APScheduler + External Cron", flush=True)
     print(f"  ➜  http://localhost:{port}", flush=True)
     print("═"*70 + "\n", flush=True)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
