@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- XOMAT AI PRO v8.3 — CSV Upload + Direct JSON + 200-Record Prediction
- - JSON & CSV upload support
- - Direct /wingo.json access
- - Prediction only after 200 records
- - Pattern Matcher + Streak + Time Sequence
- - 4-Day Training Target (5760 records)
+ XOMAT AI PRO v8.4 — Pattern 3-9 + Voice + Auto-Refresh Fix
+ - Pattern finding: 3 to 9 length (SIZE + COLOR)
+ - BIG/SMALL distribution
+ - Voice assistant (sweet female)
+ - Ball tap = refresh + speak
+ - Auto refresh every 15s (forced)
 ==============================================================================
 """
-import os, json, time, math, threading, csv, base64, io
+import os, json, time, math, threading, csv, io
 from datetime import datetime, timezone
 from collections import Counter
 import requests
@@ -25,6 +25,7 @@ except ImportError:
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
     HAS_APSCHEDULER = True
 except ImportError:
     HAS_APSCHEDULER = False
@@ -55,8 +56,8 @@ POLL_SEC     = 60
 TIMEOUT      = 12
 HISTORY_LIMIT = 20000
 
-TRAINING_TARGET    = 1440 * 4   # 5760 records (4 days)
-PREDICTION_MIN_REQ = 200        # ⭐ Prediction only after 200 records
+TRAINING_TARGET    = 1440 * 4   # 5760
+PREDICTION_MIN_REQ = 200
 
 app = Flask(__name__)
 CORS(app)
@@ -90,6 +91,17 @@ def log(msg):
 def calc_sum(records, idx, window=5):
     end = min(idx + window, len(records))
     return sum(r["number"] for r in records[idx:end])
+
+def bs_short(s):
+    """BIG→B, SMALL→S"""
+    return "B" if s == "BIG" else "S"
+
+def color_short(c):
+    """GREEN→G, RED→R, VIOLET→V"""
+    c = (c or "").upper()
+    if "GREEN" in c: return "G"
+    if "VIOLET" in c: return "V"
+    return "R"
 
 # ==============================================================================
 # STORE
@@ -142,10 +154,8 @@ def regenerate_full_csv():
         store = load_store()
         records = store["records"]
         try:
-            records = sorted(records,
-                             key=lambda r: int(r["issue"]) if str(r["issue"]).isdigit() else 0)
+            records = sorted(records, key=lambda r: int(r["issue"]) if str(r["issue"]).isdigit() else 0)
         except: pass
-
         with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["issue", "number", "size", "color", "sum5", "ts", "iso_time", "win"])
@@ -158,7 +168,6 @@ def regenerate_full_csv():
                     datetime.fromtimestamp(r.get("ts", 0), timezone.utc).isoformat() if r.get("ts") else "",
                     r.get("win") if r.get("win") is not None else "",
                 ])
-        log(f"♻ Regenerated CSV with {len(records)} records")
     except Exception as e:
         log(f"CSV regen error: {e}")
 
@@ -179,7 +188,7 @@ def fetch_api():
     return None
 
 # ==============================================================================
-# 🧠 ADVANCED PATTERN ENGINE
+# 🧠 PATTERN ENGINE v8.4
 # ==============================================================================
 class XomatEngine:
     def __init__(self, records):
@@ -192,9 +201,12 @@ class XomatEngine:
         n = self.n
         self.freq = np.zeros(10)
         self.red = self.green = self.violet = 0
+        self.big_cnt = self.small_cnt = 0
 
         for r in self.records:
             self.freq[r["number"]] += 1
+            if r["number"] >= 5: self.big_cnt += 1
+            else: self.small_cnt += 1
             for c in (r.get("color") or "").split("/"):
                 c = c.strip().upper()
                 if c == "RED": self.red += 1
@@ -245,14 +257,77 @@ class XomatEngine:
             self.bs_streak = self.color_streak = 0
             self.bs_streak_type = self.color_streak_type = "BIG"
 
+    # ─────────── Pattern 3-9 for SIZE + COLOR ───────────
+    def find_all_patterns(self, min_len=3, max_len=9):
+        """Find all SIZE and COLOR patterns from length min_len to max_len."""
+        n = self.n
+        if n < min_len + 2:
+            return {"size": {}, "color": {}}
+
+        # Chronological order (oldest first)
+        sizes_chrono = [r["size"] for r in reversed(self.records)]
+        colors_chrono = []
+        for r in reversed(self.records):
+            cs = (r.get("color") or "").split("/")
+            # For pattern matching, take the first/primary color
+            c = cs[0].strip().upper() if cs else "RED"
+            colors_chrono.append(c)
+
+        results = {"size": {}, "color": {}}
+
+        for length in range(min_len, max_len + 1):
+            if len(sizes_chrono) < length + 1:
+                continue
+
+            # ── SIZE pattern ──
+            key_sz = tuple(sizes_chrono[-length:])       # last N sizes
+            next_sz_dist = Counter()
+            samples_sz = 0
+            for i in range(length, len(sizes_chrono)):
+                window = tuple(sizes_chrono[i-length:i])
+                if window == key_sz:
+                    samples_sz += 1
+                    next_sz_dist[sizes_chrono[i]] += 1
+            if samples_sz > 0:
+                total = sum(next_sz_dist.values())
+                dom = next_sz_dist.most_common(1)[0][0]
+                results["size"][length] = {
+                    "pattern": "".join(bs_short(s) for s in key_sz),
+                    "samples": samples_sz,
+                    "dominant": dom,
+                    "confidence": round(next_sz_dist[dom] / total * 100, 1),
+                    "dist": {k: round(v/total*100, 1) for k, v in next_sz_dist.items()},
+                }
+
+            # ── COLOR pattern ──
+            key_col = tuple(colors_chrono[-length:])
+            next_col_dist = Counter()
+            samples_col = 0
+            for i in range(length, len(colors_chrono)):
+                window = tuple(colors_chrono[i-length:i])
+                if window == key_col:
+                    samples_col += 1
+                    next_col_dist[colors_chrono[i]] += 1
+            if samples_col > 0:
+                total = sum(next_col_dist.values())
+                dom = next_col_dist.most_common(1)[0][0]
+                results["color"][length] = {
+                    "pattern": "".join(color_short(c) for c in key_col),
+                    "samples": samples_col,
+                    "dominant": dom,
+                    "confidence": round(next_col_dist[dom] / total * 100, 1),
+                    "dist": {k: round(v/total*100, 1) for k, v in next_col_dist.items()},
+                }
+
+        return results
+
+    # ─────────── Original number pattern 4/5/6 ───────────
     def pattern_match(self, length=4):
-        if self.n < length + 5:
-            return None
+        if self.n < length + 5: return None
         key = [r["number"] for r in self.records[:length]]
         key_rev = tuple(key[::-1])
         outcomes_bs = Counter(); outcomes_color = Counter(); outcomes_num = Counter()
         samples = 0
-
         for i in range(length, self.n):
             window = tuple(self.records[i - j]["number"] for j in range(length - 1, -1, -1))
             if window == key_rev:
@@ -264,18 +339,15 @@ class XomatEngine:
                 for c in (nxt.get("color") or "").split("/"):
                     outcomes_color[c.strip().upper()] += 1
                 outcomes_num[nxt["number"]] += 1
-
         if samples == 0:
             return {"pattern": "-".join(map(str, key_rev)), "sample": 0,
                     "dominantBS": None, "dominantColor": None,
                     "topNums": [], "bsBreak": {}, "colorBreak": {}}
-
         total_bs = sum(outcomes_bs.values()) or 1
         total_col = sum(outcomes_color.values()) or 1
         dom_bs = outcomes_bs.most_common(1)[0][0]
         dom_color = outcomes_color.most_common(1)[0][0]
         top_nums = [n for n, _ in outcomes_num.most_common(3)]
-
         return {
             "pattern": "-".join(map(str, key_rev)),
             "sample": samples,
@@ -287,14 +359,12 @@ class XomatEngine:
         }
 
     def predict(self, periods=3):
-        # ⭐ Prediction only after PREDICTION_MIN_REQ records
         if self.n < PREDICTION_MIN_REQ:
             return self._empty(f"NEED {PREDICTION_MIN_REQ - self.n} MORE RECORDS")
 
         bayes = (self.freq + 1) / (self.n + 10)
         m1n = self.m1 / self.m1t if self.m1t else np.full(10, 0.1)
         m2n = self.m2 / self.m2t if self.m2t else np.full(10, 0.1)
-
         miss_mask = np.array([1.0 if i in self.missing else 0.0 for i in range(10)])
         vel = self.v1 - self.v2
         vmax = max(1, abs(vel).max())
@@ -305,9 +375,13 @@ class XomatEngine:
         balance = np.maximum(0, 1 - self.freq / avg)
         anti = np.ones(10); anti[self.current] = 0.0
 
+        # ── Number patterns ──
         pat4 = self.pattern_match(4)
         pat5 = self.pattern_match(5)
         pat6 = self.pattern_match(6)
+
+        # ── All sequence patterns 3-9 ──
+        all_patterns = self.find_all_patterns(3, 9)
 
         pat_score = np.zeros(10)
         pattern_boost = np.zeros(10)
@@ -325,6 +399,32 @@ class XomatEngine:
                         if pat["dominantColor"] in wingo_colors(i):
                             pattern_boost[i] += w * 0.6
 
+        # ── Sequence pattern boost (3-9) ──
+        # Take highest confidence pattern match of SIZE and COLOR
+        best_size_pat = None
+        best_color_pat = None
+        for L in range(9, 2, -1):
+            sz = all_patterns["size"].get(L)
+            if sz and sz["samples"] >= 2 and sz["confidence"] >= 50:
+                best_size_pat = sz; break
+        for L in range(9, 2, -1):
+            cl = all_patterns["color"].get(L)
+            if cl and cl["samples"] >= 2 and cl["confidence"] >= 50:
+                best_color_pat = cl; break
+
+        size_seq_boost = np.zeros(10)
+        if best_size_pat:
+            want = best_size_pat["dominant"]
+            for i in range(10):
+                if wingo_size(i) == want:
+                    size_seq_boost[i] += 0.12
+        color_seq_boost = np.zeros(10)
+        if best_color_pat:
+            want = best_color_pat["dominant"]
+            for i in range(10):
+                if want in wingo_colors(i):
+                    color_seq_boost[i] += 0.10
+
         streak_boost = np.zeros(10)
         if self.bs_streak >= 4:
             want = "SMALL" if self.bs_streak_type == "BIG" else "BIG"
@@ -339,7 +439,8 @@ class XomatEngine:
             bayes * 0.16 * 10 + m1n * 0.14 + m2n * 0.10 +
             miss_mask * 0.11 + veln * 0.09 + hotn * 0.05 + coldn * 0.05 +
             balance * 0.08 + anti * 0.02 +
-            pat_score + pattern_boost + streak_boost
+            pat_score + pattern_boost +
+            size_seq_boost + color_seq_boost + streak_boost
         )
 
         ranked = list(np.argsort(-composite))
@@ -374,12 +475,21 @@ class XomatEngine:
 
         if self.bs_streak >= 5: pattern_tag = "DRAGON STREAK"
         elif self.color_streak >= 5: pattern_tag = "COLOR STREAK"
+        elif best_size_pat and best_size_pat["samples"] >= 3: pattern_tag = f"SIZE SEQ {best_size_pat['pattern']}"
+        elif best_color_pat and best_color_pat["samples"] >= 3: pattern_tag = f"COLOR SEQ {best_color_pat['pattern']}"
         elif pat6 and pat6["sample"] >= 5: pattern_tag = "6-LENGTH PATTERN MATCH"
-        elif pat5 and pat5["sample"] >= 4: pattern_tag = "5-LENGTH PATTERN MATCH"
-        elif pat4 and pat4["sample"] >= 3: pattern_tag = "4-LENGTH PATTERN MATCH"
         elif self.m1t > 5 and (self.m1[ranked[0]] / self.m1t) > 0.18: pattern_tag = "MARKOV STRONG"
         elif max(self.v1) - min(self.v1) > 3: pattern_tag = "VELOCITY MOMENTUM"
         else: pattern_tag = "PATTERN CONVERGENCE"
+
+        # ── Big/Small distribution ──
+        total_bs = (self.big_cnt + self.small_cnt) or 1
+        bs_dist = {
+            "big": self.big_cnt,
+            "small": self.small_cnt,
+            "bigPct": round(self.big_cnt / total_bs * 100, 1),
+            "smallPct": round(self.small_cnt / total_bs * 100, 1),
+        }
 
         return {
             "number": top1["number"], "number2": top2["number"],
@@ -391,12 +501,17 @@ class XomatEngine:
             "colorStreak": self.color_streak, "colorStreakType": self.color_streak_type,
             "patternTag": pattern_tag,
             "patterns": {"len4": pat4, "len5": pat5, "len6": pat6},
+            "allPatterns": all_patterns,
+            "bestSizePat": best_size_pat,
+            "bestColorPat": best_color_pat,
+            "bsDist": bs_dist,
             "top": [int(x) for x in ranked[:3]],
             "freq": [int(x) for x in self.freq.tolist()],
             "red": self.red, "green": self.green, "violet": self.violet,
             "missing": self.missing, "total": self.n,
             "ready": self.n >= PREDICTION_MIN_REQ, "periods": periods_out,
             "recordsNeeded": max(0, PREDICTION_MIN_REQ - self.n),
+            "engineTime": datetime.now(timezone.utc).isoformat(),
         }
 
     def _empty(self, msg="LEARNING"):
@@ -409,10 +524,14 @@ class XomatEngine:
             "colorStreak": 0, "colorStreakType": "RED",
             "patternTag": msg,
             "patterns": {"len4": None, "len5": None, "len6": None},
-            "top": [0, 0, 0], "freq": [0]*10,
+            "allPatterns": {"size": {}, "color": {}},
+            "bestSizePat": None, "bestColorPat": None,
+            "bsDist": {"big": 0, "small": 0, "bigPct": 0, "smallPct": 0},
+            "top": [0,0,0], "freq": [0]*10,
             "red": 0, "green": 0, "violet": 0,
             "missing": [], "total": 0, "ready": False, "periods": [],
             "recordsNeeded": PREDICTION_MIN_REQ,
+            "engineTime": datetime.now(timezone.utc).isoformat(),
         }
 
 # ==============================================================================
@@ -434,7 +553,6 @@ def sync_store(store, api_list):
         cols = parse_api_color(item.get("color", ""))
         rec = {"issue": iss, "number": num, "size": size,
                "color": "/".join(cols), "ts": int(time.time())}
-
         pred = pending_by_issue.get(iss)
         if pred:
             num_hit = (pred["number"] == num)
@@ -448,7 +566,6 @@ def sync_store(store, api_list):
             })
         else:
             rec["win"] = None
-
         store["records"].insert(0, rec)
         new_records.append(rec)
         seen.add(iss)
@@ -456,7 +573,6 @@ def sync_store(store, api_list):
 
     if len(store["records"]) > HISTORY_LIMIT:
         store["records"] = store["records"][:HISTORY_LIMIT]
-
     if new_records:
         append_to_csv(new_records)
 
@@ -480,12 +596,37 @@ def sync_store(store, api_list):
 # CACHE
 # ==============================================================================
 _lock = threading.Lock()
-_cache = {"analysis": None, "stats": empty_stats(), "lastIssue": "--",
-          "total": 0, "online": False, "lastSync": 0, "apiStatus": "connecting",
-          "newPrediction": False}
+_cache = {
+    "analysis": None, "stats": empty_stats(),
+    "lastIssue": "--", "total": 0, "online": False,
+    "lastSync": 0, "apiStatus": "connecting",
+    "newPrediction": False,
+    "computeCount": 0,   # ⭐ हर recompute पर बढ़ेगा
+}
 
 # ==============================================================================
-# CRON JOB
+# ⭐ FORCE RECOMPUTE (FIX — हर बार चलेगा)
+# ==============================================================================
+def recompute_analysis(reason="auto"):
+    """Force recompute analysis & update cache. Always runs."""
+    try:
+        store = load_store()
+        eng = XomatEngine(store["records"])
+        an = eng.predict(periods=3)
+        with _lock:
+            _cache["analysis"] = an
+            _cache["stats"] = store["stats"]
+            _cache["lastIssue"] = store.get("lastIssue") or "--"
+            _cache["total"] = len(store["records"])
+            _cache["lastSync"] = time.time()
+            _cache["computeCount"] += 1
+        return an
+    except Exception as e:
+        log(f"recompute error: {e}")
+        return None
+
+# ==============================================================================
+# CRON FETCH
 # ==============================================================================
 def cron_fetch(trigger="internal"):
     try:
@@ -494,12 +635,16 @@ def cron_fetch(trigger="internal"):
             with _lock:
                 _cache["online"] = False
                 _cache["apiStatus"] = "offline"
+            # Still recompute (offline mode)
+            recompute_analysis(f"{trigger}-offline")
             return
+
         store = load_store()
         newest = str(api_list[0].get("issueNumber", ""))
         last = store.get("lastIssue")
+        new_issue = (newest != last)
 
-        if newest != last:
+        if new_issue:
             added = sync_store(store, api_list)
             log(f"🆕 {newest} | +{added} | {trigger}")
 
@@ -517,13 +662,10 @@ def cron_fetch(trigger="internal"):
             with _lock:
                 _cache["newPrediction"] = True
 
-        eng = XomatEngine(store["records"])
+        # ⭐ ALWAYS recompute (even if same issue)
+        recompute_analysis(trigger)
+
         with _lock:
-            _cache["analysis"] = eng.predict(periods=3)
-            _cache["stats"] = store["stats"]
-            _cache["lastIssue"] = store.get("lastIssue") or "--"
-            _cache["total"] = len(store["records"])
-            _cache["lastSync"] = time.time()
             _cache["online"] = True
             _cache["apiStatus"] = f"live ({len(api_list)})"
     except Exception as e:
@@ -549,11 +691,19 @@ def start_scheduler():
         if _scheduler and _scheduler.running: return
         _scheduler = BackgroundScheduler(daemon=True,
             job_defaults={"coalesce": True, "max_instances": 1})
+
+        # Every minute at :05s
         _scheduler.add_job(cron_fetch, CronTrigger(second=5),
                            id="fetch", replace_existing=True,
                            kwargs={"trigger": "scheduler"})
+
+        # ⭐ Force recompute every 15 seconds
+        _scheduler.add_job(recompute_analysis, IntervalTrigger(seconds=15),
+                           id="recompute", replace_existing=True,
+                           kwargs={"reason": "auto-15s"})
+
         _scheduler.start()
-        log("✅ APScheduler started — fetch at :05s every minute")
+        log("✅ APScheduler: fetch :05s + recompute every 15s")
 
 try: start_scheduler()
 except Exception as e: log(f"sched init: {e}")
@@ -564,32 +714,27 @@ def _ensure_sched():
         start_scheduler()
 
 # ==============================================================================
-# DIRECT FILE ACCESS (⭐ NEW)
+# DIRECT FILE ACCESS
 # ==============================================================================
 @app.route("/wingo.json")
 def direct_wingo_json():
-    """Direct JSON file access — /wingo.json URL."""
     if not os.path.exists(DATA_FILE):
         return Response('{"ok": false, "msg": "No data yet"}',
                         mimetype="application/json", status=404)
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            content = f.read()
-        return Response(content, mimetype="application/json",
-                        headers={"Content-Disposition": "inline"})
+            return Response(f.read(), mimetype="application/json")
     except Exception as e:
         return Response(json.dumps({"ok": False, "error": str(e)}),
                         mimetype="application/json", status=500)
 
 @app.route("/training_data.csv")
 def direct_csv():
-    """Direct CSV file access."""
     if not os.path.exists(CSV_FILE):
         return Response("No CSV yet", mimetype="text/plain", status=404)
     try:
         with open(CSV_FILE, "r", encoding="utf-8") as f:
-            content = f.read()
-        return Response(content, mimetype="text/csv")
+            return Response(f.read(), mimetype="text/csv")
     except Exception as e:
         return Response(str(e), status=500)
 
@@ -598,12 +743,12 @@ def direct_csv():
 # ==============================================================================
 @app.route("/api/analysis")
 def api_analysis():
+    # ⭐ Force fresh recompute on every request (fix for stuck prediction)
+    an = recompute_analysis("api-request")
     with _lock:
         a = _cache["analysis"]
         is_new = _cache["newPrediction"]
         _cache["newPrediction"] = False
-        if a is None:
-            return jsonify({"ok": False, "msg": "loading", "apiStatus": _cache["apiStatus"]})
         total = _cache["total"]
         progress = min(100, round(total / TRAINING_TARGET * 100, 1))
         return jsonify({
@@ -614,6 +759,7 @@ def api_analysis():
             "lastSync": _cache["lastSync"], "serverTime": time.time(),
             "apiStatus": _cache["apiStatus"],
             "isNewPrediction": is_new,
+            "computeCount": _cache.get("computeCount", 0),
             "trainingTarget": TRAINING_TARGET,
             "trainingProgress": progress,
             "trainingReady": total >= TRAINING_TARGET,
@@ -644,6 +790,7 @@ def api_debug():
             "apiStatus": _cache["apiStatus"], "total": _cache["total"],
             "lastIssue": _cache["lastIssue"], "lastSync": _cache["lastSync"],
             "hasAnalysis": _cache["analysis"] is not None,
+            "computeCount": _cache.get("computeCount", 0),
             "scheduler": "running" if (_scheduler and getattr(_scheduler, "running", False)) else "not-running",
             "fileSize": os.path.getsize(DATA_FILE) if os.path.exists(DATA_FILE) else 0,
             "csvExists": os.path.exists(CSV_FILE),
@@ -656,7 +803,6 @@ def api_debug():
 
 @app.route("/api/cron-tick")
 def api_cron_tick():
-    """External cron trigger endpoint."""
     try:
         cron_fetch(trigger="external-cron")
         with _lock:
@@ -664,40 +810,36 @@ def api_cron_tick():
                 "ok": True, "trigger": "external-cron",
                 "total": _cache["total"], "lastIssue": _cache["lastIssue"],
                 "apiStatus": _cache["apiStatus"], "serverTime": time.time(),
+                "computeCount": _cache.get("computeCount", 0),
             })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/api/prediction/refresh")
-def api_prediction_refresh():
-    """Force new prediction."""
+@app.route("/api/force-refresh")
+def api_force_refresh():
+    """⭐ Ball tap / manual trigger — full refresh."""
     try:
-        store = load_store()
-        if len(store["records"]) < PREDICTION_MIN_REQ:
-            return jsonify({
-                "ok": False,
-                "msg": f"Need {PREDICTION_MIN_REQ - len(store['records'])} more records",
-            }), 400
-        eng = XomatEngine(store["records"])
-        an = eng.predict(periods=3)
-        pending = []
-        iss = store.get("lastIssue") or "0"
-        for p in an["periods"]:
-            iss = next_issue(iss)
-            pending.append({"forIssue": iss, "number": p["number"],
-                            "bs": p["bs"], "color": p["color"], "rank": p["rank"]})
-        store["pending"] = pending
-        save_store(store)
+        # 1. Fetch fresh data
+        api_list = fetch_api()
+        if api_list:
+            store = load_store()
+            added = sync_store(store, api_list)
+            save_store(store)
+
+        # 2. Force recompute
+        an = recompute_analysis("manual-force")
+
         with _lock:
-            _cache["analysis"] = an
-            _cache["newPrediction"] = True
-            _cache["lastSync"] = time.time()
-        return jsonify({"ok": True, "prediction": {
-            "number": an["number"], "number2": an["number2"],
-            "bs": an["bs"], "bs2": an["bs2"],
-            "color": an["color"], "color2": an["color2"],
-            "patternTag": an["patternTag"],
-        }})
+            return jsonify({
+                "ok": True,
+                "refreshed": True,
+                "total": _cache["total"],
+                "lastIssue": _cache["lastIssue"],
+                "online": _cache["online"],
+                "computeCount": _cache.get("computeCount", 0),
+                "analysis": an,
+                "serverTime": time.time(),
+            })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -720,10 +862,9 @@ def api_export_csv():
                      as_attachment=True, download_name=f"xomat_training_{ts}.csv")
 
 # ==============================================================================
-# UPLOAD (JSON + CSV)
+# UPLOAD
 # ==============================================================================
 def parse_json_records(raw_bytes):
-    """Parse JSON records from bytes."""
     raw = raw_bytes.decode("utf-8", errors="replace")
     data = json.loads(raw)
     if isinstance(data, dict):
@@ -737,7 +878,6 @@ def parse_json_records(raw_bytes):
     return records
 
 def parse_csv_records(raw_bytes):
-    """Parse CSV records from bytes."""
     text = raw_bytes.decode("utf-8", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
     out = []
@@ -751,7 +891,6 @@ def parse_csv_records(raw_bytes):
     return out
 
 def clean_records(records):
-    """Validate and clean records."""
     clean = []
     for r in records:
         if not isinstance(r, dict): continue
@@ -761,10 +900,8 @@ def clean_records(records):
         iss = str(r.get("issue") or r.get("issueNumber") or r.get("period") or "").strip()
         if not iss: continue
         cols = parse_api_color(r.get("color", "")) if r.get("color") else wingo_colors(num)
-        try:
-            ts_val = int(r.get("ts") or time.time())
-        except:
-            ts_val = int(time.time())
+        try: ts_val = int(r.get("ts") or time.time())
+        except: ts_val = int(time.time())
         clean.append({
             "issue": iss, "number": num,
             "size": wingo_size(num), "color": "/".join(cols),
@@ -774,55 +911,39 @@ def clean_records(records):
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """Upload JSON OR CSV → save to timestamped path + merge into store."""
     try:
         if 'file' not in request.files:
             return jsonify({"ok": False, "msg": "No file provided"}), 400
-
         f = request.files['file']
         fn_lower = f.filename.lower()
-
         if not (fn_lower.endswith('.json') or fn_lower.endswith('.csv')):
             return jsonify({"ok": False, "msg": "Only .json or .csv allowed"}), 400
-
         raw = f.read()
-
-        # Parse based on extension
         try:
             if fn_lower.endswith('.json'):
-                records = parse_json_records(raw)
-                file_type = "json"
-            else:  # CSV
-                records = parse_csv_records(raw)
-                file_type = "csv"
+                records = parse_json_records(raw); file_type = "json"
+            else:
+                records = parse_csv_records(raw); file_type = "csv"
         except json.JSONDecodeError as e:
             return jsonify({"ok": False, "msg": f"Invalid JSON: {e}"}), 400
         except Exception as e:
             return jsonify({"ok": False, "msg": f"Parse error: {e}"}), 400
-
         if not isinstance(records, list) or not records:
             return jsonify({"ok": False, "msg": "No records found"}), 400
-
         clean = clean_records(records)
         if not clean:
             return jsonify({"ok": False, "msg": "No valid records"}), 400
 
-        # Save to timestamped path
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
         ext = "csv" if file_type == "csv" else "json"
         fname = f"{ts_str}_upload.{ext}"
         fpath = os.path.join(UPLOAD_DIR, fname)
         with open(fpath, "w", encoding="utf-8") as fh:
-            json.dump({
-                "uploadedAt": datetime.now(timezone.utc).isoformat(),
-                "source": f.filename,
-                "type": file_type,
-                "count": len(clean),
-                "records": clean,
-            }, fh, indent=2)
+            json.dump({"uploadedAt": datetime.now(timezone.utc).isoformat(),
+                       "source": f.filename, "type": file_type,
+                       "count": len(clean), "records": clean}, fh, indent=2)
 
-        # Merge into main store
         store = load_store()
         seen = {str(r["issue"]) for r in store["records"]}
         added = 0
@@ -831,33 +952,22 @@ def api_upload():
                 store["records"].append(rec)
                 seen.add(rec["issue"])
                 added += 1
-
-        # Sort newest-first
         try:
             store["records"].sort(
                 key=lambda r: int(r["issue"]) if str(r["issue"]).isdigit() else 0,
                 reverse=True)
         except: pass
-
         if store["records"]:
             store["lastIssue"] = str(store["records"][0]["issue"])
         save_store(store)
         regenerate_full_csv()
 
-        eng = XomatEngine(store["records"])
-        with _lock:
-            _cache["analysis"] = eng.predict(periods=3)
-            _cache["total"] = len(store["records"])
-            _cache["lastIssue"] = store["records"][0]["issue"] if store["records"] else "--"
+        recompute_analysis("upload")
 
-        log(f"📤 Upload: {f.filename} → {fname} | +{added} new / {len(clean)} parsed")
-
-        return jsonify({
-            "ok": True, "fileName": fname, "path": fpath,
-            "type": file_type,
-            "parsed": len(clean), "added": added,
-            "total": len(store["records"]),
-        })
+        log(f"📤 Upload: {f.filename} → {fname} | +{added} new")
+        return jsonify({"ok": True, "fileName": fname, "path": fpath,
+                        "type": file_type, "parsed": len(clean),
+                        "added": added, "total": len(store["records"])})
     except Exception as e:
         log(f"upload error: {e}")
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -874,11 +984,8 @@ def api_uploads():
                 with open(fp) as f: d = json.load(f)
                 cnt = d.get("count", len(d.get("records", [])))
             except: cnt = 0
-            files.append({
-                "name": fn, "size": os.path.getsize(fp),
-                "count": cnt,
-                "modified": datetime.fromtimestamp(os.path.getmtime(fp), timezone.utc).isoformat(),
-            })
+            files.append({"name": fn, "size": os.path.getsize(fp), "count": cnt,
+                          "modified": datetime.fromtimestamp(os.path.getmtime(fp), timezone.utc).isoformat()})
     return jsonify({"ok": True, "files": files[:50]})
 
 @app.route("/api/sequence")
@@ -890,7 +997,6 @@ def api_sequence():
                          key=lambda r: int(r["issue"]) if str(r["issue"]).isdigit() else 0,
                          reverse=True)
     except: pass
-
     limit = int(request.args.get("limit", 60))
     out = []
     for i, r in enumerate(records[:limit]):
@@ -901,6 +1007,14 @@ def api_sequence():
             "ts": r.get("ts"),
         })
     return jsonify({"ok": True, "count": len(out), "records": out})
+
+@app.route("/api/patterns")
+def api_patterns():
+    """⭐ 3-9 patterns for SIZE and COLOR."""
+    store = load_store()
+    eng = XomatEngine(store["records"])
+    patterns = eng.find_all_patterns(3, 9)
+    return jsonify({"ok": True, "patterns": patterns})
 
 @app.route("/api/training-status")
 def api_training_status():
@@ -913,16 +1027,13 @@ def api_training_status():
                 csv_rows = sum(1 for _ in f) - 1
         except: pass
     return jsonify({
-        "ok": True,
-        "jsonRecords": total,
-        "csvRows": csv_rows,
+        "ok": True, "jsonRecords": total, "csvRows": csv_rows,
         "target": TRAINING_TARGET,
         "progress": min(100, round(total / TRAINING_TARGET * 100, 2)),
         "ready": total >= TRAINING_TARGET,
         "daysOfData": round(total / 1440, 2),
         "predictionMinRequired": PREDICTION_MIN_REQ,
         "predictionReady": total >= PREDICTION_MIN_REQ,
-        "uploads": len([f for f in (os.listdir(UPLOAD_DIR) if os.path.exists(UPLOAD_DIR) else []) if f.endswith((".json", ".csv"))]),
     })
 
 # ==============================================================================
@@ -932,7 +1043,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <html class="dark" lang="en"><head>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" name="viewport"/>
-<title>XOMAT AI v8.3 - RNG Engine</title>
+<title>XOMAT AI v8.4 - RNG Engine</title>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <script>
 tailwind.config = {
@@ -943,10 +1054,8 @@ tailwind.config = {
       champagne: {50:'#FCF9F5',100:'#F7EFE5',200:'#EFE2D2',300:'#DFCDB8',800:'#4A3E31',900:'#261F17'},
       ruby:'#E61E4D', gold:'#D4AF37'
     },
-    fontFamily: {
-      sans:['-apple-system','BlinkMacSystemFont','Segoe UI','Roboto','sans-serif'],
-      mono:['SF Mono','ui-monospace','Menlo','Monaco','monospace'],
-    }
+    fontFamily: { sans:['-apple-system','BlinkMacSystemFont','Segoe UI','Roboto','sans-serif'],
+                  mono:['SF Mono','ui-monospace','Menlo','Monaco','monospace'] }
   }}
 }
 </script>
@@ -957,15 +1066,17 @@ tailwind.config = {
 }
 @keyframes spinCW { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
 @keyframes spinCCW { from{transform:rotate(360deg)} to{transform:rotate(0deg)} }
-@keyframes radarWave { 0%{transform:scale(.9);opacity:.8} 100%{transform:scale(1.6);opacity:0} }
 @keyframes digitRoll { 0%{transform:translateY(-20%);opacity:0} 100%{transform:translateY(0);opacity:1} }
-.ai-orb-core { animation: orbPulse 3.5s ease-in-out infinite; }
+.ai-orb-core { animation: orbPulse 3.5s ease-in-out infinite; cursor:pointer; transition:transform .2s; }
+.ai-orb-core:active { transform:scale(.95); }
 .ai-orbit-1  { animation: spinCW 12s linear infinite; }
 .ai-orbit-2  { animation: spinCCW 18s linear infinite; }
-.radar-ping  { animation: radarWave 2.2s cubic-bezier(0,0,.2,1) infinite; }
 .digit-roll  { animation: digitRoll .5s cubic-bezier(.4,0,.2,1); }
 .pulse-live  { animation: pulseLive 1.4s ease-in-out infinite; }
 @keyframes pulseLive { 0%,100%{opacity:1} 50%{opacity:.4} }
+.tap-hint { animation: tapPulse 1.5s ease-in-out infinite; }
+@keyframes tapPulse { 0%,100%{opacity:.6;transform:scale(1)} 50%{opacity:1;transform:scale(1.05)} }
+.pattern-bar { height:6px;border-radius:3px;background:linear-gradient(90deg,#ef4444,#fbbf24,#10b981); }
 </style>
 </head>
 <body class="bg-[#080104] text-neutral-100 min-h-screen font-sans antialiased pb-12 overflow-x-hidden">
@@ -973,7 +1084,7 @@ tailwind.config = {
 <header class="sticky top-0 z-40 bg-[#0c0106]/95 backdrop-blur-md border-b border-crimson-900/60 px-4 py-2.5 shadow-lg">
   <div class="flex items-center justify-between max-w-md mx-auto">
     <div class="flex items-center space-x-2.5">
-      <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-crimson-600 via-rose-500 to-amber-300 p-0.5 shadow-md">
+      <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-crimson-600 via-rose-500 to-amber-300 p-0.5">
         <div class="w-full h-full bg-[#140106] rounded-full flex items-center justify-center">
           <svg class="w-4 h-4 text-rose-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4"/></svg>
         </div>
@@ -983,7 +1094,7 @@ tailwind.config = {
           <span class="text-base font-black tracking-tight text-white">XOMAT</span>
           <span class="text-xs px-1.5 py-0.5 rounded bg-crimson-600/60 text-rose-200 font-bold">AI</span>
         </div>
-        <p class="text-[9px] text-neutral-400 tracking-tighter">v8.3 • JSON + CSV Upload</p>
+        <p class="text-[9px] text-neutral-400">v8.4 • Voice + Pattern 3-9</p>
       </div>
     </div>
     <div class="flex items-center space-x-2">
@@ -992,8 +1103,8 @@ tailwind.config = {
         <span class="font-medium text-[10px]" id="online-tag">Online</span>
       </div>
       <div class="px-2 py-1 rounded-lg bg-crimson-950 border border-amber-500/30 text-right">
-        <div class="text-[10px] font-bold text-amber-200 leading-none">WinGo 1M</div>
-        <div class="text-[9px] font-mono text-neutral-400 leading-none mt-0.5" id="live-clock">--:--:--</div>
+        <div class="text-[10px] font-bold text-amber-200">WinGo 1M</div>
+        <div class="text-[9px] font-mono text-neutral-400" id="live-clock">--:--:--</div>
       </div>
     </div>
   </div>
@@ -1001,63 +1112,45 @@ tailwind.config = {
 
 <main class="max-w-md mx-auto px-3.5 pt-3.5 space-y-4">
 
-  <!-- TRAINING PROGRESS -->
+  <!-- TRAINING -->
   <section class="rounded-2xl p-3 border bg-gradient-to-r from-neutral-900 via-crimson-950 to-neutral-900 border-amber-500/40 text-white shadow-xl">
     <div class="flex items-center justify-between mb-1">
-      <span class="text-[10px] uppercase tracking-widest text-amber-300 font-bold">🎯 Training Progress</span>
+      <span class="text-[10px] uppercase tracking-widest text-amber-300 font-bold">🎯 Training</span>
       <span class="text-[10px] font-mono text-amber-200" id="train-pct">0%</span>
     </div>
     <div class="w-full bg-black/60 h-2 rounded-full overflow-hidden">
-      <div id="train-bar" class="h-full bg-gradient-to-r from-amber-500 to-rose-500 transition-all" style="width:0%"></div>
+      <div id="train-bar" class="h-full bg-gradient-to-r from-amber-500 to-rose-500" style="width:0%"></div>
     </div>
     <div class="flex justify-between text-[10px] font-mono mt-1">
-      <span class="text-neutral-300"><b id="train-current">0</b> records</span>
+      <span class="text-neutral-300"><b id="train-current">0</b> rec</span>
       <span class="text-neutral-400">target: <b class="text-amber-300">5760</b></span>
       <span class="text-neutral-300"><b id="train-days">0</b> days</span>
     </div>
-    <div class="mt-2 pt-2 border-t border-white/10 flex items-center justify-between text-[10px] font-mono">
-      <span class="text-neutral-400">Prediction:</span>
-      <span id="pred-ready-badge" class="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-bold">Need 200 records</span>
+    <div class="mt-2 pt-2 border-t border-white/10 flex justify-between text-[10px] font-mono">
+      <span class="text-neutral-400">Engine runs: <b class="text-amber-300" id="compute-count">0</b></span>
+      <span id="pred-ready-badge" class="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-bold">Need 200</span>
     </div>
   </section>
 
-  <!-- TOP STATS -->
-  <section class="grid grid-cols-2 gap-2">
-    <div class="bg-champagne-100 rounded-xl p-2.5 border border-champagne-300 shadow-md text-neutral-900 flex items-center space-x-2.5">
-      <div class="w-8 h-8 rounded-lg bg-neutral-900 text-amber-300 flex items-center justify-center shrink-0">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" stroke-linecap="round" stroke-width="2"/></svg>
-      </div>
-      <div class="min-w-0">
-        <div class="text-base font-black leading-none text-neutral-950" id="stat-total">0</div>
-        <div class="text-[10px] text-neutral-600 font-medium truncate mt-0.5">Total Records</div>
-      </div>
+  <!-- BIG/SMALL DISTRIBUTION (⭐ NEW) -->
+  <section class="bg-champagne-100 rounded-2xl p-4 border border-champagne-300 shadow-lg text-neutral-900">
+    <div class="flex items-center justify-between pb-2 border-b border-champagne-300 mb-3">
+      <span class="text-xs font-black uppercase tracking-wider">Big / Small Distribution</span>
     </div>
-    <div class="bg-champagne-100 rounded-xl p-2.5 border border-champagne-300 shadow-md text-neutral-900 flex items-center space-x-2.5">
-      <div class="w-8 h-8 rounded-lg bg-neutral-900 text-rose-400 flex items-center justify-center shrink-0">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" stroke-linecap="round" stroke-width="2"/></svg>
+    <div class="space-y-2">
+      <div class="flex justify-between text-xs">
+        <span class="font-bold text-red-700">BIG</span>
+        <span class="font-mono"><b id="big-count">0</b> <span id="big-pct">(0%)</span></span>
       </div>
-      <div class="min-w-0">
-        <div class="text-base font-black leading-none text-neutral-950" id="stat-issue-short">--</div>
-        <div class="text-[10px] text-neutral-600 font-medium truncate mt-0.5">Latest Issue</div>
+      <div class="w-full bg-neutral-200 h-2 rounded-full overflow-hidden">
+        <div class="bg-red-600 h-full" id="big-bar" style="width:0%"></div>
       </div>
-    </div>
-    <div class="bg-champagne-100 rounded-xl p-2.5 border border-champagne-300 shadow-md text-neutral-900 flex items-center space-x-2.5">
-      <div class="w-8 h-8 rounded-lg bg-neutral-900 text-emerald-400 flex items-center justify-center shrink-0">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" stroke-width="2"/><path d="M12 7v5l3 2" stroke-linecap="round" stroke-width="2"/></svg>
+      <div class="flex justify-between text-xs">
+        <span class="font-bold text-emerald-700">SMALL</span>
+        <span class="font-mono"><b id="small-count">0</b> <span id="small-pct">(0%)</span></span>
       </div>
-      <div class="min-w-0">
-        <div class="text-[11px] font-bold text-neutral-950 leading-tight" id="stat-update">--</div>
-        <div class="text-[9px] font-mono text-neutral-600" id="stat-update-time">--:--:--</div>
-      </div>
-    </div>
-    <div class="bg-champagne-100 rounded-xl p-2.5 border border-champagne-300 shadow-md text-neutral-900 flex items-center space-x-2.5">
-      <div class="w-8 h-8 rounded-lg bg-emerald-900/90 text-emerald-300 flex items-center justify-center shrink-0">
-        <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 pulse-live"></span>
-      </div>
-      <div class="min-w-0">
-        <div class="text-[11px] font-black text-emerald-800 leading-tight" id="stat-status">Live</div>
-        <div class="text-[9px] text-neutral-600 font-medium">AI Status</div>
-        <div class="text-[8px] text-neutral-500">Conf: <span id="stat-conf">0%</span></div>
+      <div class="w-full bg-neutral-200 h-2 rounded-full overflow-hidden">
+        <div class="bg-emerald-600 h-full" id="small-bar" style="width:0%"></div>
       </div>
     </div>
   </section>
@@ -1065,31 +1158,24 @@ tailwind.config = {
   <!-- UPLOAD -->
   <section class="bg-champagne-100 rounded-2xl p-4 border border-champagne-300 shadow-lg text-neutral-900">
     <div class="flex items-center justify-between pb-2 border-b border-champagne-300 mb-3">
-      <div class="flex items-center space-x-2">
-        <svg class="w-4 h-4 text-neutral-800" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M7 16a4 4 0 01-.88-7.9A5 5 0 1115.9 6h.1a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" stroke-linecap="round" stroke-width="2"/></svg>
-        <span class="text-xs font-black uppercase tracking-wider">Upload JSON / CSV</span>
-      </div>
+      <span class="text-xs font-black uppercase tracking-wider">Upload JSON / CSV</span>
       <span class="text-[10px] text-neutral-500 font-mono">.json .csv</span>
     </div>
-    <label id="upload-zone" class="block border-2 border-dashed border-champagne-300 rounded-xl p-5 text-center cursor-pointer hover:border-rose-500 hover:bg-rose-50/40">
+    <label id="upload-zone" class="block border-2 border-dashed border-champagne-300 rounded-xl p-4 text-center cursor-pointer hover:border-rose-500">
       <input id="file-input" type="file" accept=".json,.csv,application/json,text/csv" class="hidden">
-      <div class="w-10 h-10 mx-auto rounded-full bg-neutral-900 text-amber-300 flex items-center justify-center mb-2">
-        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M12 4v16m8-8H4" stroke-linecap="round" stroke-width="2"/></svg>
-      </div>
       <div class="text-xs font-bold text-neutral-800">Tap to select file</div>
-      <div class="text-[10px] text-neutral-500 mt-0.5">JSON or CSV — auto-detected</div>
       <div class="text-[10px] text-rose-600 font-mono mt-1" id="upload-status">Ready</div>
     </label>
-    <div id="upload-result" class="hidden mt-3 p-2 rounded-lg bg-emerald-50 border border-emerald-300 text-[11px] text-emerald-800 font-mono"></div>
-    <div class="mt-3 pt-2 border-t border-champagne-300">
-      <div class="text-[10px] font-bold text-neutral-600 uppercase tracking-wider mb-1.5">Uploads</div>
-      <div id="uploads-list" class="space-y-1 max-h-32 overflow-y-auto">
-        <div class="text-[10px] text-neutral-500 italic">No uploads yet</div>
+    <div id="upload-result" class="hidden mt-2 p-2 rounded-lg bg-emerald-50 border border-emerald-300 text-[11px] text-emerald-800 font-mono"></div>
+    <div class="mt-2 pt-2 border-t border-champagne-300">
+      <div class="text-[10px] font-bold text-neutral-600 mb-1">Uploads</div>
+      <div id="uploads-list" class="space-y-1 max-h-24 overflow-y-auto text-[10px]">
+        <div class="text-neutral-500 italic">No uploads</div>
       </div>
     </div>
   </section>
 
-  <!-- AI ORB -->
+  <!-- AI ORB (⭐ TAP TO SPEAK) -->
   <section class="relative rounded-2xl overflow-hidden p-0.5 shadow-2xl bg-gradient-to-b from-rose-700/60 via-crimson-900 to-[#120106]">
     <div class="relative bg-gradient-to-b from-[#190209] to-[#080003] rounded-[15px] p-4 text-center">
       <div class="relative my-4 flex items-center justify-center">
@@ -1098,36 +1184,23 @@ tailwind.config = {
           <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
           <span class="w-1.5 h-1.5 rounded-full bg-rose-400"></span>
         </div>
-        <div class="ai-orb-core relative w-36 h-36 rounded-full bg-gradient-to-br from-[#8a0928] via-[#e61e4d] to-[#3a030f] flex flex-col items-center justify-center p-3 text-white border-2 border-rose-400/60">
+        <div class="ai-orb-core relative w-36 h-36 rounded-full bg-gradient-to-br from-[#8a0928] via-[#e61e4d] to-[#3a030f] flex flex-col items-center justify-center p-3 text-white border-2 border-rose-400/60" id="ai-ball" onclick="handleBallTap()">
           <div class="absolute top-1.5 left-5 w-14 h-6 rounded-full bg-white/30 blur-[2px] transform -rotate-[25deg]"></div>
           <div class="relative z-10 w-9 h-9 rounded-full bg-black/40 border border-rose-300/50 flex items-center justify-center mb-1">
             <svg class="w-5 h-5 text-rose-200" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>
           </div>
           <div class="relative z-10 text-[13px] font-black uppercase text-white">XOMAT AI</div>
-          <div class="relative z-10 text-[7px] uppercase text-rose-200/90">RNG ENGINE</div>
+          <div class="relative z-10 text-[7px] uppercase text-rose-200/90">TAP TO SPEAK</div>
+          <div class="absolute -bottom-1 left-1/2 -translate-x-1/2 text-[8px] text-amber-300 tap-hint">👆 TAP</div>
         </div>
       </div>
-      <div class="mt-2 inline-block px-4 py-1.5 rounded-full bg-crimson-950/90 border border-crimson-700/50">
+      <div class="mt-4 inline-block px-4 py-1.5 rounded-full bg-crimson-950/90 border border-crimson-700/50">
         <div class="flex items-center space-x-2 text-[11px] text-rose-200">
           <span class="w-2 h-2 rounded-full bg-amber-400 pulse-live"></span>
           <span id="learning-status">Analyzing...</span>
         </div>
       </div>
-      <p class="text-[10px] text-neutral-400 mt-1">Next update in <span id="countdown" class="font-mono text-amber-300">--s</span></p>
-      <div class="grid grid-cols-3 gap-1.5 mt-4 pt-3 border-t border-crimson-900/70">
-        <div class="bg-crimson-950/70 border border-crimson-800/60 rounded-xl p-2 text-center">
-          <div class="text-[10px] font-bold text-neutral-100">Number</div>
-          <div class="text-[8px] text-neutral-400">Freq &amp; Velocity</div>
-        </div>
-        <div class="bg-crimson-950/70 border border-crimson-800/60 rounded-xl p-2 text-center">
-          <div class="text-[10px] font-bold text-neutral-100">Size</div>
-          <div class="text-[8px] text-neutral-400" id="size-streak-info">-- x0</div>
-        </div>
-        <div class="bg-crimson-950/70 border border-crimson-800/60 rounded-xl p-2 text-center">
-          <div class="text-[10px] font-bold text-neutral-100">Color</div>
-          <div class="text-[8px] text-neutral-400" id="color-streak-info">-- x0</div>
-        </div>
-      </div>
+      <p class="text-[10px] text-neutral-400 mt-1">Next in <span id="countdown" class="font-mono text-amber-300">--s</span> · Tap ball to refresh + speak</p>
     </div>
   </section>
 
@@ -1151,9 +1224,8 @@ tailwind.config = {
     </div>
 
     <div id="pred-locked" class="hidden mb-3 p-3 rounded-xl bg-amber-50 border border-amber-300 text-center">
-      <div class="text-xs font-bold text-amber-800">🔒 Prediction Locked</div>
-      <div class="text-[10px] text-amber-700 mt-1">Need <b id="pred-needed">200</b> records to unlock</div>
-      <div class="text-[10px] text-amber-700 mt-1">Current: <b id="pred-current">0</b></div>
+      <div class="text-xs font-bold text-amber-800">🔒 Locked — Need <b id="pred-needed">200</b></div>
+      <div class="text-[10px] text-amber-700">Current: <b id="pred-current">0</b></div>
     </div>
 
     <div id="pred-cards" class="grid grid-cols-2 gap-2">
@@ -1181,24 +1253,36 @@ tailwind.config = {
       <div class="text-[9px] uppercase tracking-widest text-amber-300">Pattern</div>
       <div class="text-xs font-black" id="pattern-tag">LEARNING</div>
     </div>
+
+    <button onclick="speakCurrentPrediction()" class="mt-2 w-full p-2 rounded-lg bg-gradient-to-r from-rose-600 to-crimson-700 text-white text-xs font-bold">
+      🔊 Speak Prediction
+    </button>
   </section>
 
-  <!-- PATTERN MATCHER -->
+  <!-- ⭐ PATTERN FINDER 3-9 SIZE -->
   <section class="bg-champagne-100 rounded-2xl p-4 border border-champagne-300 shadow-lg text-neutral-900">
-    <div class="flex items-center space-x-2 pb-2 border-b border-champagne-300 mb-3">
-      <span class="text-xs font-black uppercase tracking-wider">Pattern Matcher</span>
+    <div class="flex items-center justify-between pb-2 border-b border-champagne-300 mb-3">
+      <span class="text-xs font-black uppercase tracking-wider">🎯 Size Patterns 3-9</span>
     </div>
-    <div class="space-y-2" id="pattern-list">
-      <div class="text-[11px] text-neutral-500 italic">Analyzing...</div>
+    <div class="space-y-1.5 text-[10px] font-mono" id="size-patterns-list">
+      <div class="text-neutral-500 italic text-center py-2">Loading...</div>
+    </div>
+  </section>
+
+  <!-- ⭐ PATTERN FINDER 3-9 COLOR -->
+  <section class="bg-champagne-100 rounded-2xl p-4 border border-champagne-300 shadow-lg text-neutral-900">
+    <div class="flex items-center justify-between pb-2 border-b border-champagne-300 mb-3">
+      <span class="text-xs font-black uppercase tracking-wider">🎨 Color Patterns 3-9</span>
+    </div>
+    <div class="space-y-1.5 text-[10px] font-mono" id="color-patterns-list">
+      <div class="text-neutral-500 italic text-center py-2">Loading...</div>
     </div>
   </section>
 
   <!-- TIME SEQUENCE -->
   <section class="bg-champagne-100 rounded-2xl p-4 border border-champagne-300 shadow-lg text-neutral-900">
     <div class="flex items-center justify-between pb-2 border-b border-champagne-300 mb-3">
-      <div class="flex items-center space-x-2">
-        <span class="text-xs font-black uppercase tracking-wider">Time Sequence</span>
-      </div>
+      <span class="text-xs font-black uppercase tracking-wider">Time Sequence</span>
       <span class="text-[10px] text-neutral-500 font-mono">last 60</span>
     </div>
     <div class="overflow-x-auto">
@@ -1220,7 +1304,7 @@ tailwind.config = {
     </div>
   </section>
 
-  <!-- NUMBERS GRID -->
+  <!-- NUMBERS -->
   <section class="bg-champagne-100 rounded-2xl p-4 border border-champagne-300 shadow-lg text-neutral-900">
     <div class="text-[10px] font-bold text-neutral-600 uppercase tracking-wider mb-2">Numbers 0-9</div>
     <div class="grid grid-cols-5 gap-1.5" id="numbers-grid"></div>
@@ -1228,58 +1312,34 @@ tailwind.config = {
 
   <!-- COLOR STATS -->
   <section class="bg-champagne-100 rounded-2xl p-4 border border-champagne-300 shadow-lg text-neutral-900">
-    <div class="flex items-center justify-between pb-2 border-b border-champagne-300 mb-3">
-      <span class="text-xs font-black uppercase tracking-wider">Color Distribution</span>
-    </div>
+    <div class="text-xs font-black uppercase tracking-wider pb-2 border-b border-champagne-300 mb-3">Color Distribution</div>
     <div class="space-y-2">
-      <div class="flex items-center justify-between text-xs">
-        <span class="font-bold">Red</span>
-        <span class="font-mono text-[11px]"><b id="red-count">0</b> <span id="red-pct">(0%)</span></span>
-      </div>
+      <div class="flex justify-between text-xs"><span class="font-bold">Red</span><span class="font-mono"><b id="red-count">0</b> <span id="red-pct">(0%)</span></span></div>
       <div class="w-full bg-neutral-200 h-1.5 rounded-full overflow-hidden"><div class="bg-red-600 h-full" id="red-bar" style="width:0%"></div></div>
-      <div class="flex items-center justify-between text-xs">
-        <span class="font-bold">Green</span>
-        <span class="font-mono text-[11px]"><b id="green-count">0</b> <span id="green-pct">(0%)</span></span>
-      </div>
+      <div class="flex justify-between text-xs"><span class="font-bold">Green</span><span class="font-mono"><b id="green-count">0</b> <span id="green-pct">(0%)</span></span></div>
       <div class="w-full bg-neutral-200 h-1.5 rounded-full overflow-hidden"><div class="bg-emerald-600 h-full" id="green-bar" style="width:0%"></div></div>
-      <div class="flex items-center justify-between text-xs">
-        <span class="font-bold">Violet</span>
-        <span class="font-mono text-[11px]"><b id="violet-count">0</b> <span id="violet-pct">(0%)</span></span>
-      </div>
+      <div class="flex justify-between text-xs"><span class="font-bold">Violet</span><span class="font-mono"><b id="violet-count">0</b> <span id="violet-pct">(0%)</span></span></div>
       <div class="w-full bg-neutral-200 h-1.5 rounded-full overflow-hidden"><div class="bg-purple-600 h-full" id="violet-bar" style="width:0%"></div></div>
     </div>
   </section>
 
   <!-- DOWNLOADS -->
   <section class="bg-champagne-100 rounded-2xl p-4 border border-champagne-300 shadow-lg text-neutral-900">
-    <div class="flex items-center space-x-2 pb-2 border-b border-champagne-300 mb-3">
-      <span class="text-xs font-black uppercase tracking-wider">Backup / Export</span>
-    </div>
+    <div class="text-xs font-black uppercase tracking-wider pb-2 border-b border-champagne-300 mb-3">Backup / Export</div>
     <div class="grid grid-cols-2 gap-2 mb-2">
-      <a href="/wingo.json" target="_blank" class="block text-center p-2.5 rounded-lg bg-neutral-900 text-amber-300 text-[11px] font-bold">📄 View wingo.json</a>
-      <a href="/training_data.csv" target="_blank" class="block text-center p-2.5 rounded-lg bg-neutral-900 text-emerald-300 text-[11px] font-bold">📊 View CSV</a>
+      <a href="/wingo.json" target="_blank" class="text-center p-2.5 rounded-lg bg-neutral-900 text-amber-300 text-[11px] font-bold">📄 wingo.json</a>
+      <a href="/training_data.csv" target="_blank" class="text-center p-2.5 rounded-lg bg-neutral-900 text-emerald-300 text-[11px] font-bold">📊 CSV</a>
     </div>
     <div class="grid grid-cols-2 gap-2">
-      <a href="/api/backup" class="block text-center p-2.5 rounded-lg bg-neutral-900 text-amber-300 text-[11px] font-bold">⬇ JSON Download</a>
-      <a href="/api/export-csv" class="block text-center p-2.5 rounded-lg bg-neutral-900 text-emerald-300 text-[11px] font-bold">⬇ CSV Download</a>
-    </div>
-  </section>
-
-  <!-- JSON VIEW -->
-  <section class="bg-[#0f0207] border border-crimson-800/60 rounded-2xl p-4 shadow-xl text-neutral-200">
-    <div class="flex items-center justify-between pb-2 border-b border-crimson-900 mb-3">
-      <h2 class="text-xs font-black tracking-wider text-rose-300 uppercase">RNG ANALYSIS (JSON)</h2>
-      <span class="text-[10px] text-neutral-500 font-mono">v8.3</span>
-    </div>
-    <div class="bg-black/90 p-3 rounded-xl font-mono text-[10px] overflow-auto max-h-72">
-      <pre id="json-view">Loading...</pre>
+      <a href="/api/backup" class="text-center p-2.5 rounded-lg bg-neutral-900 text-amber-300 text-[11px] font-bold">⬇ JSON DL</a>
+      <a href="/api/export-csv" class="text-center p-2.5 rounded-lg bg-neutral-900 text-emerald-300 text-[11px] font-bold">⬇ CSV DL</a>
     </div>
   </section>
 
   <footer class="pt-4 text-center">
     <div class="p-4 rounded-2xl bg-gradient-to-r from-crimson-950 via-rose-950 to-crimson-950 border border-crimson-800/40">
       <div class="text-sm italic text-amber-200/90">"Data Speaks... Xomat AI Understands..."</div>
-      <div class="text-xs font-black text-neutral-300 mt-2">XOMAT AI v8.3</div>
+      <div class="text-xs font-black text-neutral-300 mt-2">XOMAT AI v8.4 · Voice + Pattern 3-9</div>
     </div>
   </footer>
 </main>
@@ -1287,7 +1347,96 @@ tailwind.config = {
 <script>
 const $ = id => document.getElementById(id);
 let lastIssue = null;
+let ttsEnabled = false;
+let preferredVoice = null;
+let currentAnalysis = null;
 
+/* ═════════ VOICE (Sweet Female) ═════════ */
+function initVoices() {
+  const voices = speechSynthesis.getVoices();
+  if (!voices.length) return;
+
+  // Prefer sweet female voices
+  const femaleNames = [
+    'Google UK English Female', 'Google US English',
+    'Microsoft Zira', 'Samantha', 'Karen', 'Moira', 'Tessa',
+    'Victoria', 'Allison', 'Ava', 'Susan', 'Fiona'
+  ];
+  for (const name of femaleNames) {
+    const v = voices.find(v => v.name.includes(name));
+    if (v) { preferredVoice = v; return; }
+  }
+  // Fallback: en-IN or en-US female
+  const en = voices.filter(v => v.lang.startsWith('en'));
+  preferredVoice = en.find(v => v.name.toLowerCase().includes('female')) || en[0] || voices[0];
+}
+speechSynthesis.onvoiceschanged = initVoices;
+initVoices();
+
+function speak(text, opts = {}) {
+  if (!text) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'en-IN';
+  u.rate = opts.rate || 0.92;
+  u.pitch = opts.pitch || 1.15;
+  u.volume = 1.0;
+  if (preferredVoice) u.voice = preferredVoice;
+  speechSynthesis.speak(u);
+}
+
+function speakCurrentPrediction() {
+  const a = currentAnalysis;
+  if (!a || !a.ready) {
+    speak("Prediction is not ready yet. Please wait for more records.");
+    return;
+  }
+  const p1 = a.periods?.[0], p2 = a.periods?.[1];
+  let txt = "Next period prediction. ";
+  if (p1) {
+    txt += `Number ${p1.number}, ${p1.bs === 'BIG' ? 'big' : 'small'}, ${p1.color.toLowerCase()}, `;
+    txt += `confidence ${Math.round(p1.confidence)} percent. `;
+  }
+  if (p2) {
+    txt += `Alternative number ${p2.number}, ${p2.bs === 'BIG' ? 'big' : 'small'}. `;
+  }
+  if (a.bestSizePat) {
+    txt += `Size pattern ${a.bestSizePat.pattern} matched ${a.bestSizePat.samples} times. `;
+  }
+  if (a.bestColorPat) {
+    txt += `Color pattern ${a.bestColorPat.pattern} matched ${a.bestColorPat.samples} times. `;
+  }
+  txt += `Primary signal: ${a.primarySignal}. `;
+  txt += `Good luck.`;
+  speak(txt);
+}
+
+/* ═════════ BALL TAP HANDLER ═════════ */
+async function handleBallTap() {
+  // 1. Voice feedback
+  if (!ttsEnabled) {
+    ttsEnabled = true;
+    speak("Voice assistant enabled.");
+  }
+
+  // 2. Force refresh
+  $('learning-status').textContent = '🔄 Refreshing...';
+  try {
+    const r = await fetch('/api/force-refresh');
+    const d = await r.json();
+    if (d.ok) {
+      currentAnalysis = d.analysis;
+      render(d);
+      // 3. Speak the fresh prediction
+      setTimeout(() => speakCurrentPrediction(), 400);
+    }
+  } catch(e) {
+    console.error(e);
+    $('learning-status').textContent = '⚠ Refresh failed';
+  }
+}
+
+/* ═════════ CLOCK ═════════ */
 function tickClock() {
   const now = new Date();
   $('live-clock').textContent = `${String(now.getUTCHours()).padStart(2,'0')}:${String(now.getUTCMinutes()).padStart(2,'0')}:${String(now.getUTCSeconds()).padStart(2,'0')}`;
@@ -1320,44 +1469,35 @@ function colorCell(c) {
   return 'bg-red-600 text-white';
 }
 
-/* ═════ UPLOAD ═════ */
+/* ═════════ UPLOAD ═════════ */
 const fi = $('file-input'), uz = $('upload-zone'), us = $('upload-status'), ur = $('upload-result');
 if (fi) {
   fi.addEventListener('change', async e => {
     const f = e.target.files[0]; if (!f) return;
     us.textContent = `Uploading ${f.name}...`;
-    us.className = 'text-[10px] text-amber-600 font-mono mt-1';
     const fd = new FormData(); fd.append('file', f);
     try {
       const r = await fetch('/api/upload', { method: 'POST', body: fd });
       const d = await r.json();
       if (d.ok) {
         us.textContent = `✅ ${d.fileName}`;
-        us.className = 'text-[10px] text-emerald-700 font-mono mt-1';
         ur.classList.remove('hidden');
-        ur.innerHTML = `📁 <b>${d.fileName}</b> (${d.type})<br>Parsed: <b>${d.parsed}</b> · Added: <b>${d.added}</b> · Total: <b>${d.total}</b>`;
+        ur.innerHTML = `Parsed: <b>${d.parsed}</b> · Added: <b>${d.added}</b> · Total: <b>${d.total}</b>`;
         loadUploads(); loadSequence(); loadTraining(); refresh();
       } else {
         us.textContent = `❌ ${d.msg}`;
-        us.className = 'text-[10px] text-red-600 font-mono mt-1';
       }
-    } catch (e) {
-      us.textContent = `❌ Network error`;
-      us.className = 'text-[10px] text-red-600 font-mono mt-1';
-    }
+    } catch (e) { us.textContent = '❌ Network'; }
     fi.value = '';
   });
-  ['dragover','dragenter'].forEach(ev => uz.addEventListener(ev, e => { e.preventDefault(); uz.classList.add('border-rose-500','bg-rose-50/40'); }));
-  ['dragleave','drop'].forEach(ev => uz.addEventListener(ev, e => { e.preventDefault(); uz.classList.remove('border-rose-500','bg-rose-50/40'); }));
-  uz.addEventListener('drop', e => { if (e.dataTransfer.files[0]) { fi.files = e.dataTransfer.files; fi.dispatchEvent(new Event('change')); } });
 }
 
 async function loadUploads() {
   try {
     const r = await fetch('/api/uploads'); const d = await r.json();
     const box = $('uploads-list');
-    if (!d.ok || !d.files.length) { box.innerHTML = '<div class="text-[10px] text-neutral-500 italic">No uploads</div>'; return; }
-    box.innerHTML = d.files.map(f => `<div class="flex justify-between px-2 py-1 rounded bg-neutral-900 text-white text-[10px]"><span class="truncate flex-1">${f.name}</span><span class="text-amber-300 ml-2">${f.count}</span></div>`).join('');
+    if (!d.ok || !d.files.length) { box.innerHTML = '<div class="text-neutral-500 italic">No uploads</div>'; return; }
+    box.innerHTML = d.files.map(f => `<div class="flex justify-between px-2 py-1 rounded bg-neutral-900 text-white"><span class="truncate flex-1">${f.name}</span><span class="text-amber-300 ml-2">${f.count}</span></div>`).join('');
   } catch(e) {}
 }
 
@@ -1385,22 +1525,66 @@ async function loadTraining() {
       $('pred-ready-badge').className = 'px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-bold';
       $('pred-ready-badge').textContent = '✅ Ready';
     } else {
-      $('pred-ready-badge').textContent = `Need ${d.predictionMinRequired - d.jsonRecords} more`;
+      $('pred-ready-badge').textContent = `Need ${d.predictionMinRequired - d.jsonRecords}`;
     }
   } catch(e) {}
 }
 
-function renderPatterns(p) {
-  const w = $('pattern-list');
-  if (!p) { w.innerHTML = '<div class="text-[11px] text-neutral-500 italic">No patterns</div>'; return; }
-  const rows = [{key:'len6',label:'6-Length',data:p.len6},{key:'len5',label:'5-Length',data:p.len5},{key:'len4',label:'4-Length',data:p.len4}];
-  w.innerHTML = rows.map(r => {
-    const d = r.data;
-    if (!d || !d.sample) return `<div class="p-2 rounded-lg bg-neutral-100 border border-neutral-200"><div class="flex justify-between text-[11px]"><span class="font-bold text-neutral-700">${r.label}</span><span class="text-neutral-500">no match</span></div></div>`;
-    const bsB = Object.entries(d.bsBreak||{}).map(([k,v])=>`${k}:${Math.round(v*100)}%`).join(' • ');
-    const colB = Object.entries(d.colorBreak||{}).map(([k,v])=>`${k}:${Math.round(v*100)}%`).join(' • ');
-    return `<div class="p-2 rounded-lg bg-white border border-neutral-200"><div class="flex justify-between text-[11px] mb-1"><span class="font-bold">${r.label}</span><span class="text-[10px] font-mono text-neutral-500">${d.pattern}</span></div><div class="flex justify-between text-[10px] mb-1"><span>Sample: <b>${d.sample}</b></span><span class="flex gap-1"><span class="${chipCls(d.dominantBS)} text-white px-1.5 py-0.5 rounded text-[9px] font-bold">${d.dominantBS||'-'}</span><span class="${chipCls(d.dominantColor)} text-white px-1.5 py-0.5 rounded text-[9px] font-bold">${d.dominantColor||'-'}</span></span></div><div class="text-[9px] text-neutral-500">BS: ${bsB}</div><div class="text-[9px] text-neutral-500">Color: ${colB}</div></div>`;
-  }).join('');
+/* ═════════ PATTERNS 3-9 ═════════ */
+function renderPatterns3to9(patterns) {
+  const sizeWrap = $('size-patterns-list');
+  const colorWrap = $('color-patterns-list');
+  if (!patterns) {
+    sizeWrap.innerHTML = '<div class="text-neutral-500 italic text-center">No patterns</div>';
+    colorWrap.innerHTML = '<div class="text-neutral-500 italic text-center">No patterns</div>';
+    return;
+  }
+
+  function renderList(dict, type) {
+    let html = '';
+    for (let L = 3; L <= 9; L++) {
+      const d = dict[L];
+      if (!d) continue;
+      const pat = d.pattern;
+      const dom = d.dominant;
+      const conf = d.confidence;
+      const samples = d.samples;
+
+      // Size or color chip
+      let domCls = 'bg-neutral-600';
+      if (type === 'size') {
+        domCls = dom === 'BIG' ? 'bg-red-600' : 'bg-emerald-600';
+      } else {
+        const c = (dom||'').toUpperCase();
+        if (c.includes('GREEN')) domCls = 'bg-emerald-600';
+        else if (c.includes('VIOLET')) domCls = 'bg-purple-600';
+        else domCls = 'bg-red-600';
+      }
+
+      // Confidence color
+      const confColor = conf >= 70 ? 'text-emerald-600' :
+                        conf >= 55 ? 'text-amber-600' : 'text-neutral-500';
+
+      html += `<div class="flex items-center gap-2 p-2 rounded-lg bg-white border border-neutral-200">
+        <span class="font-black text-[10px] text-neutral-700 w-6 text-center">L${L}</span>
+        <span class="font-mono font-bold text-[11px] text-neutral-800 flex-1">${pat}</span>
+        <span class="px-1.5 py-0.5 rounded text-[9px] font-bold text-white ${domCls}">${dom}</span>
+        <span class="font-mono text-[9px] ${confColor} w-12 text-right">${conf}%</span>
+        <span class="font-mono text-[9px] text-neutral-500 w-12 text-right">${samples}x</span>
+      </div>`;
+    }
+    return html || '<div class="text-neutral-500 italic text-center py-2">No matches found (need more data)</div>';
+  }
+
+  sizeWrap.innerHTML = renderList(patterns.size, 'size');
+  colorWrap.innerHTML = renderList(patterns.color, 'color');
+}
+
+async function loadPatterns() {
+  try {
+    const r = await fetch('/api/patterns'); const d = await r.json();
+    if (d.ok) renderPatterns3to9(d.patterns);
+  } catch(e) {}
 }
 
 function renderNumbers(freq) {
@@ -1417,104 +1601,100 @@ async function loadNumbersMeta() {
   try { const r = await fetch('/api/numbers'); const d = await r.json(); window._colorByNum = d.colorByNum; } catch(e) {}
 }
 
+/* ═════════ MAIN REFRESH ═════════ */
 async function refresh() {
   try {
     const r = await fetch('/api/analysis'); const d = await r.json();
     if (!d.ok || !d.analysis) return;
-    const a = d.analysis;
-
-    setText('stat-total', d.total);
-    setText('stat-issue-short', (d.lastIssue||'--').slice(-5));
-    const now = new Date();
-    setText('stat-update', now.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}));
-    setText('stat-update-time', now.toISOString().slice(11,19) + ' UTC');
-    setText('stat-status', d.online ? 'Online' : 'Offline');
-    setText('stat-conf', (a.confidence||0).toFixed(1)+'%');
-    setText('online-tag', d.online ? 'Online' : 'Offline');
-
-    if (d.trainingProgress !== undefined) {
-      $('train-pct').textContent = d.trainingProgress + '%';
-      $('train-bar').style.width = d.trainingProgress + '%';
-      $('train-current').textContent = d.total;
-    }
-
-    // Pred readiness
-    const ready = d.predictionReady;
-    if (ready) {
-      $('pred-live-badge').className = 'px-2 py-0.5 rounded-full bg-emerald-600 text-white font-bold text-[10px] flex items-center gap-1';
-      $('pred-live-badge').innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-white pulse-live"></span> Live';
-      $('pred-locked').classList.add('hidden');
-      $('pred-cards').classList.remove('hidden');
-    } else {
-      $('pred-live-badge').className = 'px-2 py-0.5 rounded-full bg-amber-500 text-white font-bold text-[10px] flex items-center gap-1';
-      $('pred-live-badge').innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-white pulse-live"></span> Waiting';
-      $('pred-locked').classList.remove('hidden');
-      $('pred-cards').classList.add('hidden');
-      $('pred-needed').textContent = d.predictionMinRequired;
-      $('pred-current').textContent = d.total;
-    }
-
-    setText('primary-signal', a.primarySignal || 'BALANCED');
-    setText('p1-number', a.number); setText('p1-bs', a.bs); setText('p1-color', a.color);
-    setText('p1-conf', (a.confidence||0).toFixed(1)+'%');
-    setText('p2-number', a.number2); setText('p2-bs', a.bs2); setText('p2-color', a.color2);
-    setText('p2-conf', (a.confidence2||0).toFixed(1)+'%');
-    $('p1-bs').className = 'text-[10px] px-2 py-0.5 rounded font-bold text-white ' + chipCls(a.bs);
-    $('p1-color').className = 'text-[10px] px-2 py-0.5 rounded font-bold text-white ' + chipCls(a.color);
-    $('p2-bs').className = 'text-[10px] px-2 py-0.5 rounded font-bold text-white ' + chipCls(a.bs2);
-    $('p2-color').className = 'text-[10px] px-2 py-0.5 rounded font-bold text-white ' + chipCls(a.color2);
-
-    setText('pattern-tag', a.patternTag);
-    setText('size-streak-info', `${a.sizeStreakType} x${a.sizeStreak}`);
-    setText('color-streak-info', `${a.colorStreakType} x${a.colorStreak}`);
-    setText('learning-status', ready ? 'Model Ready' : `Need ${d.predictionMinRequired - d.total} more`);
-
-    const tc = (a.red+a.green+a.violet) || 1;
-    const rP = (a.red/tc*100), gP = (a.green/tc*100), vP = (a.violet/tc*100);
-    setText('red-count', a.red); setText('red-pct', `(${rP.toFixed(2)}%)`);
-    setText('green-count', a.green); setText('green-pct', `(${gP.toFixed(2)}%)`);
-    setText('violet-count', a.violet); setText('violet-pct', `(${vP.toFixed(2)}%)`);
-    $('red-bar').style.width = rP+'%'; $('green-bar').style.width = gP+'%'; $('violet-bar').style.width = vP+'%';
-
-    renderNumbers(a.freq);
-    renderPatterns(a.patterns);
-
-    $('json-view').textContent = JSON.stringify({
-      system: "XOMAT AI v8.3",
-      current_issue: d.lastIssue, next_issue: d.nextIssue,
-      total_records: d.total,
-      prediction_ready: ready,
-      min_required: d.predictionMinRequired,
-      analysis: {
-        primary_signal: a.primarySignal,
-        size_streak: `${a.sizeStreakType} x${a.sizeStreak}`,
-        color_streak: `${a.colorStreakType} x${a.colorStreak}`,
-        pattern_tag: a.patternTag,
-        top_numbers: a.top,
-        missing: a.missing,
-      },
-      prediction: ready ? {
-        rank1: { number: a.number, bs: a.bs, color: a.color, confidence: a.confidence },
-        rank2: { number: a.number2, bs: a.bs2, color: a.color2, confidence: a.confidence2 },
-      } : "Locked — need more records",
-    }, null, 2);
-
-    if (lastIssue !== d.lastIssue) {
-      lastIssue = d.lastIssue;
-      document.querySelectorAll('[id^="p"]').forEach(el => {
-        if (el.textContent.match(/^\d+$/)) { el.classList.remove('digit-roll'); void el.offsetWidth; el.classList.add('digit-roll'); }
-      });
-    }
+    render(d);
   } catch(e) {}
 }
 
+function render(d) {
+  const a = d.analysis;
+  if (!a) return;
+  currentAnalysis = a;
+
+  setText('stat-total', d.total);
+  setText('stat-issue-short', (d.lastIssue||'--').slice(-5));
+  const now = new Date();
+  setText('stat-update', now.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}));
+  setText('stat-update-time', now.toISOString().slice(11,19) + ' UTC');
+  setText('stat-status', d.online ? 'Online' : 'Offline');
+  setText('stat-conf', (a.confidence||0).toFixed(1)+'%');
+  setText('online-tag', d.online ? 'Online' : 'Offline');
+  setText('compute-count', d.computeCount || 0);
+
+  if (d.trainingProgress !== undefined) {
+    $('train-pct').textContent = d.trainingProgress + '%';
+    $('train-bar').style.width = d.trainingProgress + '%';
+    $('train-current').textContent = d.total;
+  }
+
+  const ready = d.predictionReady;
+  if (ready) {
+    $('pred-live-badge').className = 'px-2 py-0.5 rounded-full bg-emerald-600 text-white font-bold text-[10px] flex items-center gap-1';
+    $('pred-live-badge').innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-white pulse-live"></span> Live';
+    $('pred-locked').classList.add('hidden');
+    $('pred-cards').classList.remove('hidden');
+  } else {
+    $('pred-live-badge').className = 'px-2 py-0.5 rounded-full bg-amber-500 text-white font-bold text-[10px] flex items-center gap-1';
+    $('pred-live-badge').innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-white pulse-live"></span> Waiting';
+    $('pred-locked').classList.remove('hidden');
+    $('pred-cards').classList.add('hidden');
+    $('pred-needed').textContent = d.predictionMinRequired;
+    $('pred-current').textContent = d.total;
+  }
+
+  setText('primary-signal', a.primarySignal || 'BALANCED');
+  setText('p1-number', a.number); setText('p1-bs', a.bs); setText('p1-color', a.color);
+  setText('p1-conf', (a.confidence||0).toFixed(1)+'%');
+  setText('p2-number', a.number2); setText('p2-bs', a.bs2); setText('p2-color', a.color2);
+  setText('p2-conf', (a.confidence2||0).toFixed(1)+'%');
+  $('p1-bs').className = 'text-[10px] px-2 py-0.5 rounded font-bold text-white ' + chipCls(a.bs);
+  $('p1-color').className = 'text-[10px] px-2 py-0.5 rounded font-bold text-white ' + chipCls(a.color);
+  $('p2-bs').className = 'text-[10px] px-2 py-0.5 rounded font-bold text-white ' + chipCls(a.bs2);
+  $('p2-color').className = 'text-[10px] px-2 py-0.5 rounded font-bold text-white ' + chipCls(a.color2);
+
+  setText('pattern-tag', a.patternTag);
+  setText('learning-status', ready ? 'Ready — tap ball to speak' : `Need ${d.predictionMinRequired - d.total}`);
+
+  // Color stats
+  const tc = (a.red+a.green+a.violet) || 1;
+  const rP = (a.red/tc*100), gP = (a.green/tc*100), vP = (a.violet/tc*100);
+  setText('red-count', a.red); setText('red-pct', `(${rP.toFixed(2)}%)`);
+  setText('green-count', a.green); setText('green-pct', `(${gP.toFixed(2)}%)`);
+  setText('violet-count', a.violet); setText('violet-pct', `(${vP.toFixed(2)}%)`);
+  $('red-bar').style.width = rP+'%'; $('green-bar').style.width = gP+'%'; $('violet-bar').style.width = vP+'%';
+
+  // BIG/SMALL
+  if (a.bsDist) {
+    setText('big-count', a.bsDist.big); setText('big-pct', `(${a.bsDist.bigPct}%)`);
+    setText('small-count', a.bsDist.small); setText('small-pct', `(${a.bsDist.smallPct}%)`);
+    $('big-bar').style.width = a.bsDist.bigPct+'%';
+    $('small-bar').style.width = a.bsDist.smallPct+'%';
+  }
+
+  renderNumbers(a.freq);
+
+  if (lastIssue !== d.lastIssue) {
+    lastIssue = d.lastIssue;
+    document.querySelectorAll('[id^="p"]').forEach(el => {
+      if (el.textContent.match(/^\d+$/)) { el.classList.remove('digit-roll'); void el.offsetWidth; el.classList.add('digit-roll'); }
+    });
+  }
+}
+
+/* ═════════ BOOT ═════════ */
 loadNumbersMeta();
 loadUploads();
 loadSequence();
 loadTraining();
-setInterval(refresh, 3000);
-setInterval(loadSequence, 8000);
-setInterval(loadTraining, 10000);
+loadPatterns();
+setInterval(refresh, 5000);
+setInterval(loadSequence, 10000);
+setInterval(loadTraining, 15000);
+setInterval(loadPatterns, 20000);
 refresh();
 </script>
 </body></html>
@@ -1527,7 +1707,7 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("═"*60)
-    print("  XOMAT AI v8.3 — CSV Upload + Direct JSON + 200 Min")
+    print("  XOMAT AI v8.4 — Voice + Pattern 3-9 + Auto-Refresh Fix")
     print(f"  ➜  http://localhost:{port}")
     print(f"  🎯 Prediction after {PREDICTION_MIN_REQ} records")
     print("═"*60)
